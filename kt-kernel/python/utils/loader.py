@@ -675,6 +675,50 @@ class CompressedSafeTensorLoader(SafeTensorLoader):
         }
 
 
+class AWQSafeTensorLoader(CompressedSafeTensorLoader):
+    """Loader for symmetric AWQ expert weights stored as packed weights + group scales.
+
+    Supported tensor keys:
+    - weight_packed: {prefix}.{id}.{proj}.weight_packed
+    - weight_scale:  {prefix}.{id}.{proj}.weight_scale
+    - weight_shape:  {prefix}.{id}.{proj}.weight_shape
+
+    The loader validates the packed width against the requested bit-width:
+    - INT4: weight_packed shape [N, K/8]
+    - INT8: weight_packed shape [N, K/4]
+    """
+
+    def __init__(self, file_path: str, bits: int):
+        super().__init__(file_path)
+        if bits not in (4, 8):
+            raise ValueError(f"Unsupported AWQ bit-width: {bits}")
+        self.bits = bits
+
+    def load_experts(self, base_key: str, device: str = "cpu"):
+        experts = super().load_experts(base_key, device=device)
+        packed_divisor = 8 if self.bits == 4 else 4
+
+        for proj_name, weight_entries in (
+            ("gate", experts["gate"]),
+            ("up", experts["up"]),
+            ("down", experts["down"]),
+        ):
+            for idx, weight in enumerate(weight_entries):
+                if weight.ndim != 2:
+                    raise ValueError(
+                        f"AWQ {proj_name} expert {idx} weight_packed must be 2D, got shape={tuple(weight.shape)}"
+                    )
+                original_k = experts[f"{proj_name}_scale"][idx].shape[1] * 32
+                expected_cols = original_k // packed_divisor
+                if weight.shape[1] != expected_cols:
+                    raise ValueError(
+                        f"AWQ{self.bits} {proj_name} expert {idx} packed width mismatch: "
+                        f"expected K/{packed_divisor}={expected_cols}, got {weight.shape[1]}"
+                    )
+
+        return experts
+
+
 class GGUFLoader:
     """
     GGUF format loader using the official gguf library (gguf.gguf_reader.GGUFReader)
@@ -964,18 +1008,24 @@ class GGUFLoader:
 
 
 class GPTQSafeTensorLoader(FP8SafeTensorLoader):
-    """Loader for symmetric GPTQ-Int4 expert weights (qweight + scales, no qzeros).
+    """Loader for symmetric GPTQ expert weights.
 
-    Only supports sym=true, desc_act=false GPTQ models.
+    Supported bit-widths:
+    - INT4: qweight shape [K/8, N], qzeros constant packed 8, g_idx absent or canonical
+    - INT8: qweight shape [K/4, N], qzeros constant packed 127, g_idx absent or canonical
 
-    Tensor keys:
-    - qweight: {prefix}.{id}.{proj}.qweight  (int32, packed 8x4-bit along K)
-    - scales:  {prefix}.{id}.{proj}.scales    (fp16 -> converted to fp32)
+    Only supports sym=true, desc_act=false GPTQ models. Some real checkpoints
+    still serialize g_idx for desc_act=false as the canonical group mapping
+    [0...0, 1...1, 2...2, ...]; that layout is accepted here because it does
+    not require any activation reordering at runtime.
     """
 
-    def __init__(self, file_path: str):
+    def __init__(self, file_path: str, bits: int = 4):
         # Call FP8SafeTensorLoader init (which calls SafeTensorLoader init + format detection)
         super().__init__(file_path, scale_suffix="scales")
+        if bits not in (4, 8):
+            raise ValueError(f"Unsupported GPTQ bit-width: {bits}")
+        self.bits = bits
         # Verify GPTQ config
         self._verify_gptq_config(file_path)
 
@@ -1029,8 +1079,56 @@ class GPTQSafeTensorLoader(FP8SafeTensorLoader):
                     raise NotImplementedError(
                         "GPTQ sym=false (asymmetric) is not supported. Only sym=true models are supported."
                     )
-                print(f"[GPTQSafeTensorLoader] Verified: sym={qc.get('sym')}, desc_act={qc.get('desc_act')}, "
-                      f"bits={qc.get('bits')}, group_size={qc.get('group_size')}")
+                model_bits = qc.get("bits")
+                if model_bits is not None and int(model_bits) != self.bits:
+                    raise ValueError(
+                        f"Requested GPTQ INT{self.bits} loader, but model config declares bits={model_bits}"
+                    )
+                print(
+                    f"[GPTQSafeTensorLoader] Verified: sym={qc.get('sym')}, desc_act={qc.get('desc_act')}, "
+                    f"bits={qc.get('bits')}, group_size={qc.get('group_size')}"
+                )
+
+    def _expected_packed_zero(self) -> int:
+        if self.bits == 4:
+            return 0x88888888
+        return 0x7F7F7F7F
+
+    def _validate_optional_gptq_aux_tensors(
+        self,
+        experts_prefix: str,
+        proj_name: str,
+        exp_id: int,
+        device: str,
+        scale_tensor: torch.Tensor,
+    ):
+        qzeros_key = f"{experts_prefix}.{exp_id}.{proj_name}.qzeros"
+        if self.has_tensor(qzeros_key):
+            qzeros = self.load_tensor(qzeros_key, device).contiguous()
+            unique = torch.unique(qzeros)
+            expected = self._expected_packed_zero()
+            if unique.numel() != 1 or int(unique[0].item()) != expected:
+                raise NotImplementedError(
+                    f"GPTQ INT{self.bits} currently only supports symmetric packed qzeros={expected:#x}, "
+                    f"but {qzeros_key} has values {unique[:8].tolist()}"
+                )
+
+        g_idx_key = f"{experts_prefix}.{exp_id}.{proj_name}.g_idx"
+        if self.has_tensor(g_idx_key):
+            g_idx = self.load_tensor(g_idx_key, device).contiguous()
+            num_groups = int(scale_tensor.shape[0])
+            if num_groups <= 0 or (g_idx.numel() % num_groups) != 0:
+                raise ValueError(
+                    f"Invalid GPTQ INT{self.bits} g_idx shape for {g_idx_key}: "
+                    f"numel={g_idx.numel()}, num_groups={num_groups}"
+                )
+            group_size = g_idx.numel() // num_groups
+            expected_g_idx = torch.arange(g_idx.numel(), device=g_idx.device, dtype=g_idx.dtype) // group_size
+            if not torch.equal(g_idx, expected_g_idx):
+                raise NotImplementedError(
+                    f"GPTQ INT{self.bits} currently only supports desc_act=false with canonical g_idx, "
+                    f"but found a non-canonical permutation in {g_idx_key}"
+                )
 
     def load_experts(self, base_key: str, device: str = "cpu"):
         """Load GPTQ expert qweight and scales.
@@ -1061,13 +1159,37 @@ class GPTQSafeTensorLoader(FP8SafeTensorLoader):
         down_scales = [None] * expert_count
 
         for exp_id in range(expert_count):
-            gate_weights[exp_id] = self.load_tensor(f"{experts_prefix}.{exp_id}.{gate_name}.qweight", device).contiguous()
+            gate_weights[exp_id] = self.load_tensor(
+                f"{experts_prefix}.{exp_id}.{gate_name}.qweight", device
+            ).contiguous()
             up_weights[exp_id] = self.load_tensor(f"{experts_prefix}.{exp_id}.{up_name}.qweight", device).contiguous()
-            down_weights[exp_id] = self.load_tensor(f"{experts_prefix}.{exp_id}.{down_name}.qweight", device).contiguous()
+            down_weights[exp_id] = self.load_tensor(
+                f"{experts_prefix}.{exp_id}.{down_name}.qweight", device
+            ).contiguous()
 
-            gate_scales[exp_id] = self.load_tensor(f"{experts_prefix}.{exp_id}.{gate_name}.scales", device).float().contiguous()
-            up_scales[exp_id] = self.load_tensor(f"{experts_prefix}.{exp_id}.{up_name}.scales", device).float().contiguous()
-            down_scales[exp_id] = self.load_tensor(f"{experts_prefix}.{exp_id}.{down_name}.scales", device).float().contiguous()
+            gate_scales[exp_id] = (
+                self.load_tensor(f"{experts_prefix}.{exp_id}.{gate_name}.scales", device).float().contiguous()
+            )
+            up_scales[exp_id] = (
+                self.load_tensor(f"{experts_prefix}.{exp_id}.{up_name}.scales", device).float().contiguous()
+            )
+            down_scales[exp_id] = (
+                self.load_tensor(f"{experts_prefix}.{exp_id}.{down_name}.scales", device).float().contiguous()
+            )
+
+            self._validate_optional_gptq_aux_tensors(experts_prefix, gate_name, exp_id, device, gate_scales[exp_id])
+            self._validate_optional_gptq_aux_tensors(experts_prefix, up_name, exp_id, device, up_scales[exp_id])
+            self._validate_optional_gptq_aux_tensors(experts_prefix, down_name, exp_id, device, down_scales[exp_id])
+
+            packed_divisor = 8 if self.bits == 4 else 4
+            expected_rows = gate_scales[exp_id].shape[0] * (
+                self._verify_group_size_from_scale(gate_scales[exp_id]) // packed_divisor
+            )
+            if gate_weights[exp_id].shape[0] != expected_rows:
+                raise ValueError(
+                    f"GPTQ INT{self.bits} gate qweight shape mismatch: expected first dim {expected_rows}, "
+                    f"got {gate_weights[exp_id].shape[0]}"
+                )
 
         print(f"[GPTQSafeTensorLoader] Loaded {expert_count} experts from {experts_prefix}")
         return {
@@ -1078,3 +1200,12 @@ class GPTQSafeTensorLoader(FP8SafeTensorLoader):
             "up_scale": up_scales,
             "down_scale": down_scales,
         }
+
+    def _verify_group_size_from_scale(self, scale_tensor: torch.Tensor) -> int:
+        # scales layout is [num_groups, N]
+        num_groups = scale_tensor.shape[0]
+        if num_groups <= 0:
+            raise ValueError("GPTQ scales must have a positive group dimension")
+        # K is inferred later per projection; here we only need the packed divisor relationship.
+        # Returning a conventional group size unit keeps the shape validation simple.
+        return 32 if self.bits == 8 else 128

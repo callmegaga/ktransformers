@@ -12,6 +12,7 @@ import json
 import sys
 import glob
 import numpy as np
+
 # Add parent directory to path to import kt_kernel
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from kt_kernel import KTMoEWrapper
@@ -30,6 +31,8 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 QUANT_TO_AMX_MAP = {
     "int4": "AMXINT4",
     "int8": "AMXINT8",
+    "avxvnni_int4": "AVXVNNI_INT4",
+    "avxvnni_int8": "AVXVNNI_INT8",
     "moe_int4": "MOE_INT4",
     "moe_int8": "MOE_INT8",
 }
@@ -44,6 +47,7 @@ MINIMAX_WEIGHT_MAP = {
     "w3": ("up", "ffn_up_exps"),
 }
 
+
 @triton.jit
 def weight_dequant_kernel(x_ptr, s_ptr, y_ptr, M, N, BLOCK_SIZE: tl.constexpr):
     pid_m = tl.program_id(axis=0)
@@ -57,6 +61,7 @@ def weight_dequant_kernel(x_ptr, s_ptr, y_ptr, M, N, BLOCK_SIZE: tl.constexpr):
     s = tl.load(s_ptr + pid_m * n + pid_n)
     y = x * s
     tl.store(y_ptr + offs, y, mask=mask)
+
 
 def weight_dequant(x: torch.Tensor, s: torch.Tensor, block_size: int = 128) -> torch.Tensor:
     """Dequantize FP8 weight with block-wise scaling.
@@ -74,6 +79,7 @@ def weight_dequant(x: torch.Tensor, s: torch.Tensor, block_size: int = 128) -> t
     grid = lambda meta: (triton.cdiv(M, meta["BLOCK_SIZE"]), triton.cdiv(N, meta["BLOCK_SIZE"]))
     weight_dequant_kernel[grid](x, s, y, M, N, BLOCK_SIZE=block_size)
     return y
+
 
 def load_model_config(input_path: str, input_type: str = None) -> Dict:
     """Load model configuration from config.json
@@ -145,6 +151,14 @@ def load_model_config(input_path: str, input_type: str = None) -> Dict:
 
     return model_config
 
+
+def format_quant_backend_name(quant_method: str) -> str:
+    backend_name = QUANT_TO_AMX_MAP.get(quant_method.lower())
+    if backend_name is None:
+        raise ValueError(f"Unsupported quantization method: {quant_method}")
+    return backend_name
+
+
 def pack(imatrix: torch.Tensor):
     """
     Packs a 4-bit integer matrix into a packed 32-bit integer matrix.
@@ -160,6 +174,7 @@ def pack(imatrix: torch.Tensor):
     qmatrix = torch.bitwise_left_shift(imatrix, shifts[None, None, None, :]).sum(dim=-1)
     qmatrix = qmatrix.to(torch.int32)
     return qmatrix
+
 
 def unpack(qmatrix: torch.Tensor):
     """
@@ -177,6 +192,7 @@ def unpack(qmatrix: torch.Tensor):
     imatrix = imatrix.to(torch.int8) & 0x0F  # eventually correct overflow
     return imatrix
 
+
 def reverse_awq_interleaving(imatrix: torch.Tensor):
     """Reverse AWQ interleaving to get original order"""
     # Reshape to handle interleaving at pack level
@@ -185,6 +201,7 @@ def reverse_awq_interleaving(imatrix: torch.Tensor):
     # Apply reverse AWQ pack order
     imatrix_reordered = imatrix_reshaped[:, :, :, REVERSE_AWQ_PACK_ORDER]
     return imatrix_reordered.view(original_shape)
+
 
 def unpack_reverse_awq_interleaving(qweight: torch.Tensor, qzeros: torch.Tensor = None):
     """
@@ -211,6 +228,7 @@ def unpack_reverse_awq_interleaving(qweight: torch.Tensor, qzeros: torch.Tensor 
 
     return iweights_original, izeros_original
 
+
 def pack_column_major_1d(iweights: torch.Tensor, izeros: torch.Tensor = None):
     """
     Pack INT4 -> I32 then flatten to 1D with different logic for weights vs zeros
@@ -234,11 +252,13 @@ def pack_column_major_1d(iweights: torch.Tensor, izeros: torch.Tensor = None):
 
     return qweight, qzeros
 
+
 class ConverterBase:
     """Base class for converting model weights.
     Subclasses must implement `_convert_layer_experts` to handle the expert
     tensor transformation for a given quantization method (e.g., awq, int4, int8).
     """
+
     def __init__(
         self,
         input_path: str,
@@ -393,6 +413,7 @@ class ConverterBase:
             layer_idx: Layer index
         """
         import shutil
+
         layer_path = os.path.join(self.output_path, f"_layer_{layer_idx}")
         if os.path.exists(layer_path):
             shutil.rmtree(layer_path)
@@ -413,7 +434,7 @@ class ConverterBase:
 
         tensors = {}
         # Map quant_method to AMX format for file naming
-        amx_method = QUANT_TO_AMX_MAP.get(self.quant_method, "AMXINT4").replace("AMX", "")
+        amx_method = format_quant_backend_name(self.quant_method).replace("AMX", "")
 
         # Iterate through all NUMA folders
         for numa_idx in range(self.threadpool_count):
@@ -427,12 +448,8 @@ class ConverterBase:
                 # For each projection (down, gate, up)
                 for proj_name, proj_key in PROJ_MAPPINGS:
                     # Build file patterns
-                    quant_pattern = os.path.join(
-                        numa_folder, f"{amx_method}_{proj_name}_{expert_id}_*Byte_quant_.kt"
-                    )
-                    scale_pattern = os.path.join(
-                        numa_folder, f"{amx_method}_{proj_name}_{expert_id}_*Byte_scale_.kt"
-                    )
+                    quant_pattern = os.path.join(numa_folder, f"{amx_method}_{proj_name}_{expert_id}_*Byte_quant_.kt")
+                    scale_pattern = os.path.join(numa_folder, f"{amx_method}_{proj_name}_{expert_id}_*Byte_scale_.kt")
                     # Find files using glob
                     quant_files = glob.glob(quant_pattern)
                     scale_files = glob.glob(scale_pattern)
@@ -546,13 +563,29 @@ class ConverterBase:
             src_path = os.path.join(self.input_path, config_file)
             if os.path.exists(src_path):
                 import shutil
+
                 dst_path = os.path.join(self.output_path, config_file)
                 shutil.copy2(src_path, dst_path)
                 print(f"Copied: {config_file}")
+        config_path = os.path.join(self.output_path, "config.json")
+        if os.path.exists(config_path):
+            with open(config_path, "r", encoding="utf-8") as f:
+                config = json.load(f)
+            config["amx_quantization"] = {
+                "converted": True,
+                "method": self.quant_method.lower(),
+                "backend": format_quant_backend_name(self.quant_method),
+                "numa_count": self.threadpool_count,
+            }
+            with open(config_path, "w", encoding="utf-8") as f:
+                json.dump(config, f, indent=2, ensure_ascii=False)
+                f.write("\n")
+            print(f"Updated quantization metadata in: {config_path}")
 
     def close(self):
         """Close all file handles"""
         self.file_handle_map.clear()
+
 
 class AWQToColumnMajorConverter(ConverterBase):
     """Convert raw AWQ safetensors to NUMA-sliced column-major format."""
@@ -626,11 +659,13 @@ class AWQToColumnMajorConverter(ConverterBase):
         print(f"  Generated {len(output_tensors)} column-major 1D tensors in {elapsed:.2f}s")
         return output_tensors
 
+
 class OnlineQuantConverter(ConverterBase):
     """Convert FP8/FP16/BF16 weights to quantized format using AMXMoEWrapper.
     Performs online quantization (FP8/FP16/BF16 -> INT4/INT8) using AMXMoEWrapper
     with NUMA-aware memory management and automatic weight saving.
     """
+
     def __init__(
         self,
         input_path: str,
@@ -800,7 +835,7 @@ class OnlineQuantConverter(ConverterBase):
         physical_to_logical_map = torch.arange(self.num_experts, dtype=torch.int64)
 
         # Map quant_method to AMX method format
-        amx_method = QUANT_TO_AMX_MAP.get(self.quant_method, "AMXINT4")
+        amx_method = format_quant_backend_name(self.quant_method)
 
         # Create KTMoEWrapper instance for this layer
         # gpu_experts_mask: all False means all experts are on CPU for conversion
@@ -850,12 +885,14 @@ class OnlineQuantConverter(ConverterBase):
             print(f"  Keeping layer folder structure at {self.output_path}/_layer_{layer_idx}")
             return {}
 
+
 class MiniMaxConverter(ConverterBase):
     """Convert MiniMax model weights with FP8/FP16/BF16 to quantized format.
     MiniMax uses different weight naming: w1 (gate), w2 (down), w3 (up)
     instead of standard gate_proj/up_proj/down_proj.
     Uses KTMoEWrapper for online quantization.
     """
+
     def __init__(
         self,
         input_path: str,
@@ -997,7 +1034,7 @@ class MiniMaxConverter(ConverterBase):
         # Create physical_to_logical_map: identity mapping where position i maps to expert i
         physical_to_logical_map = torch.arange(len(expert_ids), dtype=torch.int64)
 
-        amx_method = QUANT_TO_AMX_MAP.get(self.quant_method, "AMXINT4")
+        amx_method = format_quant_backend_name(self.quant_method)
 
         wrapper = KTMoEWrapper(
             layer_idx=layer_idx,
@@ -1038,12 +1075,15 @@ class MiniMaxConverter(ConverterBase):
             print(f"  Layer {layer_idx} quantized and saved in {elapsed:.2f}s")
             return {}
 
+
 """
 Example usage(test passed):
 python convert_cpu_weights.py --input-path /mnt/data3/models/DeepSeek-R1-0528/ --input-type fp8 --output /mnt/data3/models/DeepSeek-R1-0528-INT4-test --quant-method int4 --cpuinfer-threads 60 --threadpool-count 2
 python convert_cpu_weights.py --input-path /mnt/data3/models/DeepSeek-R1-0528/ --input-type fp8 --output /mnt/data3/models/DeepSeek-R1-0528-INT8-test --quant-method int8 --cpuinfer-threads 60 --threadpool-count 2
 python convert_cpu_weights.py --input-path /mnt/data2/models/Qwen3-Next-80B-A3B-Instruct --input-type bf16 --output /mnt/data2/models/Qwen3-Next-80B-A3B-Instruct-INT4-test --quant-method int4 --cpuinfer-threads 60 --threadpool-count 2
 """
+
+
 def main():
     parser = argparse.ArgumentParser(description="Convert SafeTensors to column major 1D format")
     parser.add_argument("--input-path", "-i", required=True, help="Input directory with safetensors")
@@ -1056,7 +1096,7 @@ def main():
     parser.add_argument("--output", "-o", required=True, help="Output directory for converted safetensors")
     parser.add_argument(
         "--quant-method",
-        choices=["int4", "int8", "awq", "moe_int4", "moe_int8"],
+        choices=["int4", "int8", "avxvnni_int4", "avxvnni_int8", "awq", "moe_int4", "moe_int8"],
         default="int4",
         help="Quantization method for output (default: int4)",
     )
@@ -1121,7 +1161,14 @@ def main():
                 input_type=None,
                 merge_to_safetensor=merge_to_safetensor,
             )
-        elif quant_method in ["int4", "int8", "moe_int4", "moe_int8"] and args.input_type in ["fp8", "fp16", "bf16"]:
+        elif quant_method in [
+            "int4",
+            "int8",
+            "avxvnni_int4",
+            "avxvnni_int8",
+            "moe_int4",
+            "moe_int8",
+        ] and args.input_type in ["fp8", "fp16", "bf16"]:
             if is_minimax:
                 converter = MiniMaxConverter(
                     args.input_path,
@@ -1159,8 +1206,10 @@ def main():
     except Exception as e:
         print(f"Error during conversion: {e}")
         import traceback
+
         traceback.print_exc()
         return 1
+
 
 if __name__ == "__main__":
     exit(main())

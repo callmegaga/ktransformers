@@ -24,7 +24,7 @@ _kt() {
         '--gpu-experts[Number of GPU experts]:count:'
         '--cpu-threads[Number of CPU threads]:count:'
         '--tensor-parallel-size[Tensor parallel size]:size:'
-        '--kt-method[KT method]:method:(AMXINT4 FP8 RAWINT4)'
+        '--kt-method[KT method]:method:(AMXINT4 AMXINT8 AVXVNNI_INT4 AVXVNNI_INT8 FP8 RAWINT4)'
         '--attention-backend[Attention backend]:backend:(triton flashinfer)'
         '--max-total-tokens[Maximum total tokens]:tokens:'
         '--dry-run[Show command without executing]'

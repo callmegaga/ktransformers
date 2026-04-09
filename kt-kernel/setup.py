@@ -45,6 +45,7 @@ Or build wheel:
 
 Resulting wheel exposes a top-level package `kt_kernel` with AMXMoEWrapper and other kernel wrappers.
 """
+
 from __future__ import annotations
 import os
 import re
@@ -730,6 +731,7 @@ setup(
     python_requires=">=3.8",
     packages=[
         "kt_kernel",
+        "kt_kernel.eval",
         "kt_kernel.utils",
         "kt_kernel.cli",
         "kt_kernel.cli.commands",
@@ -738,6 +740,7 @@ setup(
     ],
     package_dir={
         "kt_kernel": "python",
+        "kt_kernel.eval": "python/eval",
         "kt_kernel.utils": "python/utils",
         "kt_kernel.cli": "python/cli",
         "kt_kernel.cli.commands": "python/cli/commands",

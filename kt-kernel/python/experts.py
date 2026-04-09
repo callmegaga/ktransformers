@@ -46,7 +46,7 @@ class KTMoEWrapper:
             threadpool_count=2,
             weight_path="/path/to/weights",
             chunked_prefill_size=512,
-            method="AMXINT4"  # or "AMXINT8", "LLAMAFILE"
+            method="AMXINT4"  # or "AMXINT8", "AVXVNNI_INT8", "AVXVNNI_INT4", "GPTQ_INT8", "AWQ_INT4", "AWQ_INT8", "LLAMAFILE"
         )
     """
 
@@ -87,15 +87,17 @@ class KTMoEWrapper:
             cpu_save: Whether to save weights to CPU memory
             max_deferred_experts_per_token: Number of experts per token to defer. Defaults to 0.
             numa_nodes: Explicit list of NUMA node IDs for subpool mapping. If None, defaults to sequential.
-            method: Backend method ("AMXINT4", "AMXINT8", "RAWINT4", "FP8", "BF16", "LLAMAFILE", "MOE_INT4", "MOE_INT8")
+            method: Backend method ("AMXINT4", "AMXINT8", "AVXVNNI_INT4", "AVXVNNI_INT8",
+                    "RAWINT4", "FP8", "BF16", "GPTQ_INT4", "GPTQ_INT8", "AWQ_INT4", "AWQ_INT8",
+                    "LLAMAFILE", "MOE_INT4", "MOE_INT8")
 
         Returns:
             An instance of the appropriate backend implementation (e.g., AMXMoEWrapper)
         """
         # Select backend based on method
-        if method in ["AMXINT4", "AMXINT8"]:
+        if method in ["AMXINT4", "AMXINT8", "AVXVNNI_INT4", "AVXVNNI_INT8"]:
             backend_cls = AMXMoEWrapper
-        elif method in ["RAWINT4", "FP8", "BF16", "FP8_PERCHANNEL", "GPTQ_INT4"]:
+        elif method in ["RAWINT4", "FP8", "BF16", "FP8_PERCHANNEL", "GPTQ_INT4", "GPTQ_INT8", "AWQ_INT4", "AWQ_INT8"]:
             backend_cls = NativeMoEWrapper
         elif method == "LLAMAFILE":
             backend_cls = LlamafileMoEWrapper

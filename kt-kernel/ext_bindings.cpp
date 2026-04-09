@@ -47,6 +47,11 @@ static const bool _is_plain_ = false;
 #if defined(__x86_64__)
 #include "operators/avx2/bf16-moe.hpp"
 #include "operators/avx2/fp8-moe.hpp"
+#include "operators/avx2/awq_int4_avxvnni-moe.hpp"
+#include "operators/avx2/awq_int8_avxvnni-moe.hpp"
+#include "operators/avx2/gptq_int8_avxvnni-moe.hpp"
+#include "operators/avx2/int4_avxvnni-moe.hpp"
+#include "operators/avx2/int8_avxvnni-moe.hpp"
 #include "operators/avx2/gptq_int4_avxvnni-moe.hpp"
 #include "operators/avx2/gptq_int4-moe.hpp"
 #endif
@@ -589,8 +594,18 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
   bind_moe_module<AVX2_BF16_MOE_TP<avx2::GemmKernelAVX2BF16>>(moe_module, "AVX2BF16_MOE");
   bind_moe_module<AVX2_FP8_MOE_TP<avx2::GemmKernelAVX2FP8>>(moe_module, "AVX2FP8_MOE");
   bind_moe_module<AVX2_GPTQ_INT4_MOE_TP<avx2::GemmKernelAVX2GPTQInt4>>(moe_module, "AVX2GPTQInt4_MOE");
+  bind_moe_module<AVXVNNI256_INT8_MOE_TP<avxvnni_int8::GemmKernelAVXVNNI256Int8>>(moe_module,
+                                                                                   "AVXVNNI256Int8_MOE");
+  bind_moe_module<AVXVNNI256_INT4_MOE_TP<avxvnni_int4::GemmKernelAVXVNNI256Int4>>(moe_module,
+                                                                                    "AVXVNNI256Int4_MOE");
   bind_moe_module<AVXVNNI256_GPTQ_INT4_MOE_TP<avxvnni::GemmKernelAVXVNNI256GPTQInt4>>(moe_module,
                                                                                         "AVXVNNI256GPTQInt4_MOE");
+  bind_moe_module<AVXVNNI256_GPTQ_INT8_MOE_TP<avxvnni_gptq_int8::GemmKernelAVXVNNI256GPTQInt8>>(
+      moe_module, "AVXVNNI256GPTQInt8_MOE");
+  bind_moe_module<AVXVNNI256_AWQ_INT4_MOE_TP<avxvnni_awq_int4::GemmKernelAVXVNNI256AWQInt4>>(
+      moe_module, "AVXVNNI256AWQInt4_MOE");
+  bind_moe_module<AVXVNNI256_AWQ_INT8_MOE_TP<avxvnni_awq_int8::GemmKernelAVXVNNI256AWQInt8>>(
+      moe_module, "AVXVNNI256AWQInt8_MOE");
 #endif
 
 #if defined(USE_MOE_KERNEL)

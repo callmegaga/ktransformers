@@ -12,8 +12,14 @@ from rich.panel import Panel
 from rich.prompt import Prompt, Confirm, IntPrompt
 from kt_kernel.cli.i18n import t
 
-
 console = Console()
+
+
+def format_quant_method_name(method: str) -> str:
+    method_upper = method.upper()
+    if method_upper.startswith(("AMX", "AVXVNNI", "MOE_")):
+        return method_upper
+    return f"AMX{method_upper}"
 
 
 def select_model_to_quantize() -> Optional[Any]:
@@ -79,10 +85,13 @@ def configure_quantization_method() -> Dict[str, str]:
     console.print(f"[bold]{t('quant_method_label')}[/bold]")
     console.print(f"  [cyan][1][/cyan] {t('quant_int4_desc')}")
     console.print(f"  [cyan][2][/cyan] {t('quant_int8_desc')}")
+    console.print("  [cyan][3][/cyan] AVX-VNNI INT4")
+    console.print("  [cyan][4][/cyan] AVX-VNNI INT8")
     console.print()
 
-    method_choice = Prompt.ask(t("quant_select_method"), choices=["1", "2"], default="1")
-    method = "int4" if method_choice == "1" else "int8"
+    method_choice = Prompt.ask(t("quant_select_method"), choices=["1", "2", "3", "4"], default="1")
+    method_map = {"1": "int4", "2": "int8", "3": "avxvnni_int4", "4": "avxvnni_int8"}
+    method = method_map[method_choice]
 
     console.print()
     console.print(f"[bold]{t('quant_input_type_label')}[/bold]")
@@ -137,22 +146,22 @@ def configure_output_path(model: Any, method: str, numa_nodes: int) -> Path:
 
     # Generate default output path
     model_path = Path(model.path)
-    method_upper = method.upper()
+    method_name = format_quant_method_name(method)
     settings = get_settings()
 
     # Priority: paths.weights > paths.models[0] > model's parent directory
     weights_dir = settings.weights_dir
     if weights_dir and weights_dir.exists():
         # Use configured weights directory (highest priority)
-        default_output = weights_dir / f"{model_path.name}-AMX{method_upper}-NUMA{numa_nodes}"
+        default_output = weights_dir / f"{model_path.name}-{method_name}-NUMA{numa_nodes}"
     else:
         # Use first model storage path
         model_paths = settings.get_model_paths()
         if model_paths and model_paths[0].exists():
-            default_output = model_paths[0] / f"{model_path.name}-AMX{method_upper}-NUMA{numa_nodes}"
+            default_output = model_paths[0] / f"{model_path.name}-{method_name}-NUMA{numa_nodes}"
         else:
             # Fallback to model's parent directory
-            default_output = model_path.parent / f"{model_path.name}-AMX{method_upper}-NUMA{numa_nodes}"
+            default_output = model_path.parent / f"{model_path.name}-{method_name}-NUMA{numa_nodes}"
 
     console.print(f"[dim]{t('quant_default_path')}[/dim]", default_output)
     console.print()
@@ -188,7 +197,7 @@ def calculate_quantized_size(source_path: Path, input_type: str, quant_method: s
 
     # Bits mapping
     input_bits = {"fp8": 8, "fp16": 16, "bf16": 16}
-    quant_bits = {"int4": 4, "int8": 8}
+    quant_bits = {"int4": 4, "int8": 8, "avxvnni_int4": 4, "avxvnni_int8": 8}
 
     input_bit = input_bits.get(input_type, 16)
     quant_bit = quant_bits.get(quant_method, 4)

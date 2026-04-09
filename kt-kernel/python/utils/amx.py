@@ -11,6 +11,7 @@ from .loader import (
     FP8SafeTensorLoader,
     BF16SafeTensorLoader,
     GPTQSafeTensorLoader,
+    AWQSafeTensorLoader,
 )
 from kt_kernel_ext.moe import MOEConfig
 import kt_kernel_ext.moe as _moe_mod
@@ -24,6 +25,11 @@ AMXFP8PerChannel_MOE = getattr(_moe_mod, "AMXFP8PerChannel_MOE", None)
 AVX2BF16_MOE = getattr(_moe_mod, "AVX2BF16_MOE", None)
 AVX2FP8_MOE = getattr(_moe_mod, "AVX2FP8_MOE", None)
 AVX2GPTQInt4_MOE = getattr(_moe_mod, "AVX2GPTQInt4_MOE", None)
+AVXVNNI256GPTQInt8_MOE = getattr(_moe_mod, "AVXVNNI256GPTQInt8_MOE", None)
+AVXVNNI256AWQInt4_MOE = getattr(_moe_mod, "AVXVNNI256AWQInt4_MOE", None)
+AVXVNNI256AWQInt8_MOE = getattr(_moe_mod, "AVXVNNI256AWQInt8_MOE", None)
+AVXVNNI256Int8_MOE = getattr(_moe_mod, "AVXVNNI256Int8_MOE", None)
+AVXVNNI256Int4_MOE = getattr(_moe_mod, "AVXVNNI256Int4_MOE", None)
 AVXVNNI256GPTQInt4_MOE = getattr(_moe_mod, "AVXVNNI256GPTQInt4_MOE", None)
 
 _HAS_AMXINT4_SUPPORT = AMXInt4_MOE is not None
@@ -35,6 +41,11 @@ _HAS_FP8_PERCHANNEL_SUPPORT = AMXFP8PerChannel_MOE is not None
 _HAS_AVX2_BF16_SUPPORT = AVX2BF16_MOE is not None
 _HAS_AVX2_FP8_SUPPORT = AVX2FP8_MOE is not None
 _HAS_AVX2_GPTQ_INT4_SUPPORT = AVX2GPTQInt4_MOE is not None
+_HAS_AVXVNNI256_GPTQ_INT8_SUPPORT = AVXVNNI256GPTQInt8_MOE is not None
+_HAS_AVXVNNI256_AWQ_INT4_SUPPORT = AVXVNNI256AWQInt4_MOE is not None
+_HAS_AVXVNNI256_AWQ_INT8_SUPPORT = AVXVNNI256AWQInt8_MOE is not None
+_HAS_AVXVNNI256_INT8_SUPPORT = AVXVNNI256Int8_MOE is not None
+_HAS_AVXVNNI256_INT4_SUPPORT = AVXVNNI256Int4_MOE is not None
 _HAS_AVXVNNI256_GPTQ_INT4_SUPPORT = AVXVNNI256GPTQInt4_MOE is not None
 
 
@@ -75,13 +86,36 @@ def _select_gptq_int4_backend():
     return None
 
 
+def _require_host_avx_vnni(method: str):
+    if not _HOST_HAS_AVX_VNNI:
+        raise RuntimeError(f"{method} backend requested, but the current CPU does not support avx_vnni.")
+
+
+def _select_gptq_int8_backend():
+    if _HAS_AVXVNNI256_GPTQ_INT8_SUPPORT and _HOST_HAS_AVX_VNNI:
+        return AVXVNNI256GPTQInt8_MOE
+    return None
+
+
+def _select_awq_int4_backend():
+    if _HAS_AVXVNNI256_AWQ_INT4_SUPPORT and _HOST_HAS_AVX_VNNI:
+        return AVXVNNI256AWQInt4_MOE
+    return None
+
+
+def _select_awq_int8_backend():
+    if _HAS_AVXVNNI256_AWQ_INT8_SUPPORT and _HOST_HAS_AVX_VNNI:
+        return AVXVNNI256AWQInt8_MOE
+    return None
+
+
 class AMXMoEWrapper(BaseMoEWrapper):
     """
     AMX-based MoE wrapper implementation.
-    Supports AMXINT4 and AMXINT8 quantization methods.
+    Supports AMXINT4/AMXINT8 and AVXVNNI_INT4/AVXVNNI_INT8 quantization methods.
     """
 
-    _safetensor_loader_instance = None  # Singleton SafeTensorLoader
+    _safetensor_loader_instances = {}
 
     def __init__(
         self,
@@ -119,7 +153,7 @@ class AMXMoEWrapper(BaseMoEWrapper):
             chunked_prefill_size: Maximum prefill chunk size
             cpu_save: Whether to save weights to CPU memory
             max_deferred_experts_per_token: Number of experts per token to defer. Defaults to 0.
-            method: AMX quantization method ("AMXINT4" or "AMXINT8")
+            method: Quantization method ("AMXINT4", "AMXINT8", "AVXVNNI_INT4" or "AVXVNNI_INT8")
         """
         if method == "AMXINT4" and not _HAS_AMXINT4_SUPPORT:
             raise RuntimeError(
@@ -133,6 +167,20 @@ class AMXMoEWrapper(BaseMoEWrapper):
                 "  - AVX512F + AVX512BW (VNNI optional)\n"
                 "Please recompile kt_kernel_ext with AVX512 enabled."
             )
+        if method == "AVXVNNI_INT4" and not _HAS_AVXVNNI256_INT4_SUPPORT:
+            raise RuntimeError(
+                "AVXVNNI_INT4 backend not available. Required ISA:\n"
+                "  - AVX2 + AVX-VNNI\n"
+                "Please recompile kt_kernel_ext with x86 AVX2 support enabled."
+            )
+        if method == "AVXVNNI_INT8" and not _HAS_AVXVNNI256_INT8_SUPPORT:
+            raise RuntimeError(
+                "AVXVNNI_INT8 backend not available. Required ISA:\n"
+                "  - AVX2 + AVX-VNNI\n"
+                "Please recompile kt_kernel_ext with x86 AVX2 support enabled."
+            )
+        if method in {"AVXVNNI_INT4", "AVXVNNI_INT8"} and not _HOST_HAS_AVX_VNNI:
+            raise RuntimeError(f"{method} backend requested, but the current CPU does not support avx_vnni.")
 
         # Initialize base class
         super().__init__(
@@ -161,9 +209,10 @@ class AMXMoEWrapper(BaseMoEWrapper):
 
         # Initialize SafeTensor loader (singleton)
         if self.load_merged_weight:
-            if AMXMoEWrapper._safetensor_loader_instance is None:
-                AMXMoEWrapper._safetensor_loader_instance = SafeTensorLoader(weight_path)
-            self.safetensor_loader = AMXMoEWrapper._safetensor_loader_instance
+            cache_key = os.path.abspath(weight_path)
+            if cache_key not in AMXMoEWrapper._safetensor_loader_instances:
+                AMXMoEWrapper._safetensor_loader_instances[cache_key] = SafeTensorLoader(weight_path)
+            self.safetensor_loader = AMXMoEWrapper._safetensor_loader_instances[cache_key]
 
         # AMX-specific weight storage
         self.gate_weights = None
@@ -223,6 +272,10 @@ class AMXMoEWrapper(BaseMoEWrapper):
             self.moe = AMXInt4_MOE(moe_config)
         elif self.method == "AMXINT8":
             self.moe = AMXInt8_MOE(moe_config)
+        elif self.method == "AVXVNNI_INT4":
+            self.moe = AVXVNNI256Int4_MOE(moe_config)
+        elif self.method == "AVXVNNI_INT8":
+            self.moe = AVXVNNI256Int8_MOE(moe_config)
         else:
             raise NotImplementedError(f"Unsupported AMX method: {self.method}")
 
@@ -359,6 +412,10 @@ class AMXMoEWrapper(BaseMoEWrapper):
             self.moe = AMXInt4_MOE(moe_config)
         elif self.method == "AMXINT8":
             self.moe = AMXInt8_MOE(moe_config)
+        elif self.method == "AVXVNNI_INT4":
+            self.moe = AVXVNNI256Int4_MOE(moe_config)
+        elif self.method == "AVXVNNI_INT8":
+            self.moe = AVXVNNI256Int8_MOE(moe_config)
         else:
             raise NotImplementedError(f"Unsupported AMX method: {self.method}")
 
@@ -379,7 +436,7 @@ class AMXMoEWrapper(BaseMoEWrapper):
 class NativeMoEWrapper(BaseMoEWrapper):
     """Wrapper for RAWINT4/FP8/FP8_PERCHANNEL/BF16 experts stored in compressed SafeTensor format."""
 
-    _native_loader_instance = None
+    _native_loader_cache = {}
 
     def __init__(
         self,
@@ -430,6 +487,21 @@ class NativeMoEWrapper(BaseMoEWrapper):
                 "Please recompile kt_kernel_ext with AVX2 enabled.\n"
                 "AVX-VNNI-256 will be selected automatically when available on the current CPU."
             )
+        if method == "GPTQ_INT8" and _select_gptq_int8_backend() is None:
+            raise RuntimeError(
+                "GPTQ_INT8 backend not available.\n"
+                "Please recompile kt_kernel_ext with x86 AVX2 + AVX-VNNI support enabled."
+            )
+        if method == "AWQ_INT4" and _select_awq_int4_backend() is None:
+            raise RuntimeError(
+                "AWQ_INT4 backend not available.\n"
+                "Please recompile kt_kernel_ext with x86 AVX2 + AVX-VNNI support enabled."
+            )
+        if method == "AWQ_INT8" and _select_awq_int8_backend() is None:
+            raise RuntimeError(
+                "AWQ_INT8 backend not available.\n"
+                "Please recompile kt_kernel_ext with x86 AVX2 + AVX-VNNI support enabled."
+            )
 
         super().__init__(
             layer_idx=layer_idx,
@@ -448,21 +520,29 @@ class NativeMoEWrapper(BaseMoEWrapper):
             numa_nodes=numa_nodes,
         )
 
-        if NativeMoEWrapper._native_loader_instance is None:
+        cache_key = (method, os.path.abspath(weight_path))
+        if cache_key not in NativeMoEWrapper._native_loader_cache:
             if method == "RAWINT4":
-                NativeMoEWrapper._native_loader_instance = CompressedSafeTensorLoader(weight_path)
+                NativeMoEWrapper._native_loader_cache[cache_key] = CompressedSafeTensorLoader(weight_path)
             elif method == "FP8":
-                NativeMoEWrapper._native_loader_instance = FP8SafeTensorLoader(weight_path)
+                NativeMoEWrapper._native_loader_cache[cache_key] = FP8SafeTensorLoader(weight_path)
             elif method == "FP8_PERCHANNEL":
-                # Use FP8SafeTensorLoader with per-channel scale format
-                NativeMoEWrapper._native_loader_instance = FP8SafeTensorLoader(weight_path, scale_suffix="weight_scale")
+                NativeMoEWrapper._native_loader_cache[cache_key] = FP8SafeTensorLoader(
+                    weight_path, scale_suffix="weight_scale"
+                )
             elif method == "BF16":
-                NativeMoEWrapper._native_loader_instance = BF16SafeTensorLoader(weight_path)
+                NativeMoEWrapper._native_loader_cache[cache_key] = BF16SafeTensorLoader(weight_path)
             elif method == "GPTQ_INT4":
-                NativeMoEWrapper._native_loader_instance = GPTQSafeTensorLoader(weight_path)
+                NativeMoEWrapper._native_loader_cache[cache_key] = GPTQSafeTensorLoader(weight_path, bits=4)
+            elif method == "GPTQ_INT8":
+                NativeMoEWrapper._native_loader_cache[cache_key] = GPTQSafeTensorLoader(weight_path, bits=8)
+            elif method == "AWQ_INT4":
+                NativeMoEWrapper._native_loader_cache[cache_key] = AWQSafeTensorLoader(weight_path, bits=4)
+            elif method == "AWQ_INT8":
+                NativeMoEWrapper._native_loader_cache[cache_key] = AWQSafeTensorLoader(weight_path, bits=8)
             else:
                 raise NotImplementedError(f"Unsupported method for NativeMoEWrapper: {method}")
-        self.loader = NativeMoEWrapper._native_loader_instance
+        self.loader = NativeMoEWrapper._native_loader_cache[cache_key]
 
         self.gate_weights = None
         self.up_weights = None
@@ -527,6 +607,12 @@ class NativeMoEWrapper(BaseMoEWrapper):
                     self.up_scales = [t.to(torch.float32).contiguous() for t in weights["up_scale"]]
                     self.down_scales = [t.to(torch.float32).contiguous() for t in weights["down_scale"]]
                 assert self.gate_scales[0].dtype == torch.float32, "Expected float32 scales for FP8_PERCHANNEL"
+            elif self.method in {"GPTQ_INT4", "GPTQ_INT8", "AWQ_INT4", "AWQ_INT8"}:
+                if self.gate_scales[0].dtype != torch.float32:
+                    self.gate_scales = [t.to(torch.float32).contiguous() for t in weights["gate_scale"]]
+                    self.up_scales = [t.to(torch.float32).contiguous() for t in weights["up_scale"]]
+                    self.down_scales = [t.to(torch.float32).contiguous() for t in weights["down_scale"]]
+                assert self.gate_scales[0].dtype == torch.float32, f"Expected float32 scales for {self.method}"
 
         t2 = time.time()
 
@@ -600,6 +686,36 @@ class NativeMoEWrapper(BaseMoEWrapper):
             backend_cls = _select_gptq_int4_backend()
             if backend_cls is None:
                 raise RuntimeError("No GPTQ_INT4 backend is available after runtime selection.")
+            self.moe = backend_cls(moe_config)
+        elif self.method == "GPTQ_INT8":
+            group_count = self.gate_scales[0].shape[0]  # [K/gs, N]
+            actual_gs = self.hidden_size // group_count
+            moe_config.quant_config.bits = 8
+            moe_config.quant_config.group_size = actual_gs
+            moe_config.quant_config.zero_point = False
+            backend_cls = _select_gptq_int8_backend()
+            if backend_cls is None:
+                raise RuntimeError("No GPTQ_INT8 backend is available after runtime selection.")
+            self.moe = backend_cls(moe_config)
+        elif self.method == "AWQ_INT4":
+            group_count = self.gate_scales[0].shape[1]  # [N, K/gs]
+            actual_gs = self.hidden_size // group_count
+            moe_config.quant_config.bits = 4
+            moe_config.quant_config.group_size = actual_gs
+            moe_config.quant_config.zero_point = False
+            backend_cls = _select_awq_int4_backend()
+            if backend_cls is None:
+                raise RuntimeError("No AWQ_INT4 backend is available after runtime selection.")
+            self.moe = backend_cls(moe_config)
+        elif self.method == "AWQ_INT8":
+            group_count = self.gate_scales[0].shape[1]  # [N, K/gs]
+            actual_gs = self.hidden_size // group_count
+            moe_config.quant_config.bits = 8
+            moe_config.quant_config.group_size = actual_gs
+            moe_config.quant_config.zero_point = False
+            backend_cls = _select_awq_int8_backend()
+            if backend_cls is None:
+                raise RuntimeError("No AWQ_INT8 backend is available after runtime selection.")
             self.moe = backend_cls(moe_config)
         elif self.method == "BF16":
             # BF16 has no quantization config needed

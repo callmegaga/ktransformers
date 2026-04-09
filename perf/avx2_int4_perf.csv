@@ -1,0 +1,15 @@
+# Timestamp: 2026-04-05T12:41:27.719763
+# CPU: Intel(R) Core(TM) Ultra 7 265K
+# CPU Tier: AVX2-only
+# Cores: 20 logical / 20x1 physical
+# Memory: 46.4 GB total / 44.14 GB available
+# ISA: avx2 fma
+"# GPU[0]: NVIDIA GeForce RTX 4060 Ti, 16380 MiB"
+# GPU Count: 1
+#
+Model,Metric,hi (2),1K (969),2K (1930),4K (3846),8K (7678),TP,GPU Experts,Method,CPU Infer,Threadpool
+Qwen3.5-35B-A3B-GPTQ-Int4,Output length,10tokens,300tokens,300tokens,300tokens,300tokens,1,24,GPTQ_INT4,8,1
+Qwen3.5-35B-A3B-GPTQ-Int4,Prefill token/s,17.3,67.0,68.5,60.9,116.5,1,24,GPTQ_INT4,8,1
+Qwen3.5-35B-A3B-GPTQ-Int4,Decode  token/s,29.9,26.1,26.2,26.1,25.7,1,24,GPTQ_INT4,8,1
+Qwen3.5-35B-A3B-GPTQ-Int4,TTFT (ms),58,15319,29958,67334,70344,1,24,GPTQ_INT4,8,1
+Qwen3.5-35B-A3B-GPTQ-Int4,TOPT (ms/tok),33.5,38.2,38.2,38.3,39.0,1,24,GPTQ_INT4,8,1

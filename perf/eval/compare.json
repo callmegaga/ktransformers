@@ -1,0 +1,83 @@
+[
+  {
+    "task": "wikitext",
+    "metric": "perplexity",
+    "direction": "lower_is_better",
+    "baseline": 10.636495201176011,
+    "candidate": 10.634721296719277,
+    "abs_delta": -0.0017739045,
+    "rel_delta_pct": -0.0166775283
+  },
+  {
+    "task": "c4",
+    "metric": "perplexity",
+    "direction": "lower_is_better",
+    "baseline": 12.165321691973913,
+    "candidate": 12.145293330819133,
+    "abs_delta": -0.0200283612,
+    "rel_delta_pct": -0.1646348671
+  },
+  {
+    "task": "hellaswag",
+    "metric": "acc,none",
+    "direction": "higher_is_better",
+    "baseline": 0.5,
+    "candidate": 0.5,
+    "abs_delta": 0.0,
+    "rel_delta_pct": 0.0
+  },
+  {
+    "task": "arc_challenge",
+    "metric": "acc,none",
+    "direction": "higher_is_better",
+    "baseline": 1.0,
+    "candidate": 1.0,
+    "abs_delta": 0.0,
+    "rel_delta_pct": 0.0
+  },
+  {
+    "task": "winogrande",
+    "metric": "acc,none",
+    "direction": "higher_is_better",
+    "baseline": 0.5,
+    "candidate": 0.5,
+    "abs_delta": 0.0,
+    "rel_delta_pct": 0.0
+  },
+  {
+    "task": "piqa",
+    "metric": "acc,none",
+    "direction": "higher_is_better",
+    "baseline": 0.5,
+    "candidate": 0.5,
+    "abs_delta": 0.0,
+    "rel_delta_pct": 0.0
+  },
+  {
+    "task": "mmlu_pro",
+    "metric": "exact_match,custom-extract",
+    "direction": "higher_is_better",
+    "baseline": 0.8928571428571429,
+    "candidate": 0.8928571428571429,
+    "abs_delta": 0.0,
+    "rel_delta_pct": 0.0
+  },
+  {
+    "task": "gsm8k",
+    "metric": "exact_match,strict-match",
+    "direction": "higher_is_better",
+    "baseline": 1.0,
+    "candidate": 1.0,
+    "abs_delta": 0.0,
+    "rel_delta_pct": 0.0
+  },
+  {
+    "task": "ifeval",
+    "metric": "prompt_level_strict_acc,none",
+    "direction": "higher_is_better",
+    "baseline": 1.0,
+    "candidate": 1.0,
+    "abs_delta": 0.0,
+    "rel_delta_pct": 0.0
+  }
+]

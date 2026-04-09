@@ -32,6 +32,15 @@ class QuantMethod(str, Enum):
 
     INT4 = "int4"
     INT8 = "int8"
+    AVXVNNI_INT4 = "avxvnni_int4"
+    AVXVNNI_INT8 = "avxvnni_int8"
+
+
+def format_quant_method_name(method: str) -> str:
+    method_upper = method.upper()
+    if method_upper.startswith(("AMX", "AVXVNNI", "MOE_")):
+        return method_upper
+    return f"AMX{method_upper}"
 
 
 def quant(
@@ -209,15 +218,23 @@ def quant(
 
             if weights_dir and weights_dir.exists():
                 # Use configured weights directory (highest priority)
-                output = weights_dir / f"{input_path.name}-AMX{method.value.upper()}-NUMA{final_numa_nodes}"
+                output = (
+                    weights_dir / f"{input_path.name}-{format_quant_method_name(method.value)}-NUMA{final_numa_nodes}"
+                )
             else:
                 # Use first model storage path
                 model_paths = settings.get_model_paths()
                 if model_paths and model_paths[0].exists():
-                    output = model_paths[0] / f"{input_path.name}-AMX{method.value.upper()}-NUMA{final_numa_nodes}"
+                    output = (
+                        model_paths[0]
+                        / f"{input_path.name}-{format_quant_method_name(method.value)}-NUMA{final_numa_nodes}"
+                    )
                 else:
                     # Fallback to model's parent directory
-                    output = input_path.parent / f"{input_path.name}-AMX{method.value.upper()}-NUMA{final_numa_nodes}"
+                    output = (
+                        input_path.parent
+                        / f"{input_path.name}-{format_quant_method_name(method.value)}-NUMA{final_numa_nodes}"
+                    )
 
         print_info(t("quant_output_path", path=str(output)))
         print_info(t("quant_method", method=method.value.upper()))
@@ -238,7 +255,7 @@ def quant(
 
         # Estimate quantized size
         input_bits = {"fp8": 8, "fp16": 16, "bf16": 16}
-        quant_bits = {"int4": 4, "int8": 8}
+        quant_bits = {"int4": 4, "int8": 8, "avxvnni_int4": 4, "avxvnni_int8": 8}
         input_bit = input_bits.get(input_type, 16)
         quant_bit = quant_bits.get(method.value, 4)
         ratio = quant_bit / input_bit

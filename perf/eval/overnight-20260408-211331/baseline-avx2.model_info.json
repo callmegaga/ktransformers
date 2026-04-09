@@ -1,0 +1,1 @@
+{"model_path":"/home/wy/Work/models/Qwen3.5-35B-A3B-GPTQ-Int4","tokenizer_path":"/home/wy/Work/models/Qwen3.5-35B-A3B-GPTQ-Int4","is_generation":true,"preferred_sampling_params":null,"weight_version":"default","has_image_understanding":true,"has_audio_understanding":false,"model_type":"qwen3_5_moe","architectures":["Qwen3_5MoeForConditionalGeneration"]}

@@ -1,0 +1,10 @@
+task,metric,direction,baseline,candidate,abs_delta,rel_delta_pct
+wikitext,perplexity,lower_is_better,10.636495201176011,10.634721296719277,-0.0017739045,-0.0166775283
+c4,perplexity,lower_is_better,12.165321691973913,12.145293330819133,-0.0200283612,-0.1646348671
+hellaswag,"acc,none",higher_is_better,0.5,0.5,0.0,0.0
+arc_challenge,"acc,none",higher_is_better,1.0,1.0,0.0,0.0
+winogrande,"acc,none",higher_is_better,0.5,0.5,0.0,0.0
+piqa,"acc,none",higher_is_better,0.5,0.5,0.0,0.0
+mmlu_pro,"exact_match,custom-extract",higher_is_better,0.8928571428571429,0.8928571428571429,0.0,0.0
+gsm8k,"exact_match,strict-match",higher_is_better,1.0,1.0,0.0,0.0
+ifeval,"prompt_level_strict_acc,none",higher_is_better,1.0,1.0,0.0,0.0

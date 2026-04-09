@@ -48,6 +48,10 @@ def detect_quant_method(layer_path: str):
                 return "moe_int4", "MOE_INT4"
             elif f.startswith("MOE_INT8_"):
                 return "moe_int8", "MOE_INT8"
+            elif f.startswith("AVXVNNI_INT4_"):
+                return "avxvnni_int4", "AVXVNNI_INT4"
+            elif f.startswith("AVXVNNI_INT8_"):
+                return "avxvnni_int8", "AVXVNNI_INT8"
             elif f.startswith("INT4_"):
                 return "int4", "INT4"
             elif f.startswith("INT8_"):
@@ -98,7 +102,7 @@ def process_layer(layer_path: str, amx_prefix: str, layer_idx: int) -> dict:
 
             for quant_file in quant_files:
                 filename = os.path.basename(quant_file)
-                remainder = filename[len(f"{amx_prefix}_{proj_name}_"):]
+                remainder = filename[len(f"{amx_prefix}_{proj_name}_") :]
                 try:
                     expert_idx = int(remainder.split("_")[0])
                 except (ValueError, IndexError):
@@ -110,7 +114,7 @@ def process_layer(layer_path: str, amx_prefix: str, layer_idx: int) -> dict:
 
             for scale_file in scale_files:
                 filename = os.path.basename(scale_file)
-                remainder = filename[len(f"{amx_prefix}_{proj_name}_"):]
+                remainder = filename[len(f"{amx_prefix}_{proj_name}_") :]
                 try:
                     expert_idx = int(remainder.split("_")[0])
                 except (ValueError, IndexError):
@@ -125,7 +129,7 @@ def process_layer(layer_path: str, amx_prefix: str, layer_idx: int) -> dict:
 
 def write_shards(accumulated_tensors: dict, output_path: str, shard_counter: dict, keep_remainder: bool = True):
     """Write accumulated tensors to one or more shard files.
-    
+
     Args:
         accumulated_tensors: Dict of tensors to write
         output_path: Output directory
@@ -151,9 +155,9 @@ def write_shards(accumulated_tensors: dict, output_path: str, shard_counter: dic
     else:
         full_shards = total_tensors // max_tensors
         remainder = total_tensors % max_tensors
-        
+
         items = list(accumulated_tensors.items())
-        
+
         # Write full shards
         for i in range(full_shards):
             batch = dict(items[i * max_tensors : (i + 1) * max_tensors])
@@ -161,22 +165,22 @@ def write_shards(accumulated_tensors: dict, output_path: str, shard_counter: dic
             save_file(batch, output_file)
             print(f"  Saved {len(batch)} tensors to {output_file}")
             current_shard += 1
-        
+
         # Keep remainder for next batch if enabled
         if keep_remainder and remainder > 0:
-            remainder_items = dict(items[full_shards * max_tensors:])
+            remainder_items = dict(items[full_shards * max_tensors :])
             accumulated_tensors.clear()
             accumulated_tensors.update(remainder_items)
             print(f"  Rolled over {remainder} tensors to next batch")
         elif remainder > 0:
             # Write remainder as final shard
-            batch = dict(items[full_shards * max_tensors:])
+            batch = dict(items[full_shards * max_tensors :])
             output_file = os.path.join(output_path, f"model-{current_shard:05d}.safetensors")
             save_file(batch, output_file)
             print(f"  Saved {len(batch)} tensors to {output_file}")
             current_shard += 1
             accumulated_tensors.clear()
-        
+
         shard_counter["shard"] = current_shard
 
 
@@ -199,13 +203,37 @@ def copy_config_files(original_path: str, output_path: str):
             print(f"Warning: {config_file} not found in {original_path}, skipping", file=sys.stderr)
 
 
+def write_quant_metadata(output_path: str, quant_method: str, numa_count: int):
+    config_path = os.path.join(output_path, "config.json")
+    if not os.path.exists(config_path):
+        return
+    with open(config_path, "r", encoding="utf-8") as f:
+        config = json.load(f)
+    backend_name = {
+        "int4": "AMXINT4",
+        "int8": "AMXINT8",
+        "avxvnni_int4": "AVXVNNI_INT4",
+        "avxvnni_int8": "AVXVNNI_INT8",
+        "moe_int4": "MOE_INT4",
+        "moe_int8": "MOE_INT8",
+    }[quant_method]
+    config["amx_quantization"] = {
+        "converted": True,
+        "method": quant_method,
+        "backend": backend_name,
+        "numa_count": numa_count,
+    }
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(config, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    print(f"Updated quantization metadata in: {config_path}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Merge CPU-optimized weights from nested folder structure to sharded safetensors"
     )
-    parser.add_argument(
-        "--input-path", "-i", required=True, help="Input directory with nested _layer_* folders"
-    )
+    parser.add_argument("--input-path", "-i", required=True, help="Input directory with nested _layer_* folders")
     parser.add_argument("--output", "-o", required=True, help="Output directory for merged safetensors")
     parser.add_argument(
         "--original-path",
@@ -268,6 +296,7 @@ def main():
     if args.original_path:
         print(f"\nCopying config files from {args.original_path}...")
         copy_config_files(args.original_path, args.output)
+        write_quant_metadata(args.output, quant_method, len(discover_numa_folders(first_layer_path)))
 
     total_shards = shard_counter["shard"] - 1
     print(f"\nConversion completed! Created {total_shards} shard(s) in {args.output}")

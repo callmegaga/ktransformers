@@ -21,8 +21,16 @@ from kt_kernel.cli.utils.input_validators import (
     prompt_int_list_with_retry,
 )
 
-
 console = Console()
+
+
+def format_kt_method_name(method: Optional[str], default: str = "AMXINT4") -> str:
+    if not method:
+        return default
+    method_upper = method.upper()
+    if method_upper.startswith(("AMX", "AVXVNNI", "MOE_", "RAW", "FP")):
+        return method_upper
+    return f"AMX{method_upper}"
 
 
 def get_gpu_info() -> List[Dict[str, Any]]:
@@ -204,10 +212,10 @@ def select_inference_method(model: Any) -> Optional[Dict[str, Any]]:
     options.append(str(option_idx))
     option_map[str(option_idx)] = "raw"
 
-    # Option 3: AMX quantized inference
+    # Option 3: CPU quantized inference
     option_idx = len(options) + 1
-    console.print(f"  [cyan][{option_idx}][/cyan] [bold]AMX Quantized Inference[/bold]")
-    console.print("      [dim]INT4 / INT8 (CPU optimized)[/dim]")
+    console.print(f"  [cyan][{option_idx}][/cyan] [bold]CPU Quantized Inference[/bold]")
+    console.print("      [dim]AMX / AVX-VNNI INT4 / INT8[/dim]")
     options.append(str(option_idx))
     option_map[str(option_idx)] = "amx"
 
@@ -437,12 +445,10 @@ def _configure_amx_inference(model: Any) -> Optional[Dict[str, Any]]:
 
     for i, m in enumerate(amx_models, 1):
         is_amx, numa = is_amx_weights(m.path)
-        method_str = m.amx_quant_method.upper() if m.amx_quant_method else "Unknown"
+        method_str = format_kt_method_name(m.amx_quant_method, default="Unknown")
         match_indicator = "[green]★[/green]" if m.amx_source_model == model.name else " "
         console.print(f"  {match_indicator} [cyan][{i}][/cyan] {m.name}")
-        console.print(
-            f"      [dim]Method: AMX{method_str}, NUMA: {numa}, Source: {m.amx_source_model or 'Unknown'}[/dim]"
-        )
+        console.print(f"      [dim]Method: {method_str}, NUMA: {numa}, Source: {m.amx_source_model or 'Unknown'}[/dim]")
 
     console.print()
     choice = prompt_int_with_retry(
@@ -454,7 +460,7 @@ def _configure_amx_inference(model: Any) -> Optional[Dict[str, Any]]:
 
     selected_amx = amx_models[choice - 1]
     is_amx, numa = is_amx_weights(selected_amx.path)
-    kt_method = f"AMX{selected_amx.amx_quant_method.upper()}" if selected_amx.amx_quant_method else "AMXINT4"
+    kt_method = format_kt_method_name(selected_amx.amx_quant_method)
 
     return {
         "method": "amx",
