@@ -271,6 +271,116 @@ def run_backend_accuracy_test(backend_name, backend_cls, threshold, qlen):
             assert diff < threshold, f"{backend_name} accuracy test failed: diff={diff.item():.6f} >= {threshold}"
 
 
+def run_avxvnni_fused_vs_legacy_decode_test(backend_cls):
+    physical_to_logical_map = torch.tensor(range(expert_num), dtype=torch.int64).contiguous()
+    cpu_infer = kt_kernel_ext.CPUInfer(CPUINFER_PARAM)
+
+    with torch.inference_mode():
+        gate_bf16 = (torch.randn((expert_num, intermediate_size, hidden_size), dtype=torch.float32) / 10.0).to(
+            torch.bfloat16
+        )
+        up_bf16 = (torch.randn((expert_num, intermediate_size, hidden_size), dtype=torch.float32) / 10.0).to(
+            torch.bfloat16
+        )
+        down_bf16 = (torch.randn((expert_num, hidden_size, intermediate_size), dtype=torch.float32) / 10.0).to(
+            torch.bfloat16
+        )
+
+        gate_qw_list, gate_scale_list = [], []
+        up_qw_list, up_scale_list = [], []
+        down_qw_list, down_scale_list = [], []
+
+        for e in range(expert_num):
+            qw, sc = gptq_sym_int4_quantize(gate_bf16[e])
+            gate_qw_list.append(qw)
+            gate_scale_list.append(sc)
+
+            qw, sc = gptq_sym_int4_quantize(up_bf16[e])
+            up_qw_list.append(qw)
+            up_scale_list.append(sc)
+
+            qw, sc = gptq_sym_int4_quantize(down_bf16[e])
+            down_qw_list.append(qw)
+            down_scale_list.append(sc)
+
+        gate_qw = torch.stack(gate_qw_list).contiguous()
+        gate_scales = torch.stack(gate_scale_list).contiguous()
+        up_qw = torch.stack(up_qw_list).contiguous()
+        up_scales = torch.stack(up_scale_list).contiguous()
+        down_qw = torch.stack(down_qw_list).contiguous()
+        down_scales = torch.stack(down_scale_list).contiguous()
+
+        def make_moe(fused_env):
+            old_value = os.environ.get("KT_AVXVNNI_FUSED_MOE")
+            os.environ["KT_AVXVNNI_FUSED_MOE"] = fused_env
+            try:
+                config = kt_kernel_ext.moe.MOEConfig(expert_num, num_experts_per_tok, hidden_size, intermediate_size, 0)
+                config.max_len = max_len
+                config.gate_proj = gate_qw.data_ptr()
+                config.up_proj = up_qw.data_ptr()
+                config.down_proj = down_qw.data_ptr()
+                config.gate_scale = gate_scales.data_ptr()
+                config.up_scale = up_scales.data_ptr()
+                config.down_scale = down_scales.data_ptr()
+                config.quant_config.bits = 4
+                config.quant_config.group_size = group_size
+                config.quant_config.zero_point = False
+                config.pool = cpu_infer.backend_
+
+                moe = backend_cls(config)
+                cpu_infer.submit(moe.load_weights_task(physical_to_logical_map.data_ptr()))
+                cpu_infer.sync()
+                return moe
+            finally:
+                if old_value is None:
+                    os.environ.pop("KT_AVXVNNI_FUSED_MOE", None)
+                else:
+                    os.environ["KT_AVXVNNI_FUSED_MOE"] = old_value
+
+        legacy_moe = make_moe("0")
+        fused_moe = make_moe("1")
+
+        qlen = 1
+        for i in range(validation_iter):
+            expert_ids = torch.randperm(expert_num)[:num_experts_per_tok].view(1, -1).contiguous()
+            weights = torch.rand((qlen, num_experts_per_tok), dtype=torch.float32).contiguous()
+            input_data = (torch.randn((qlen, hidden_size), dtype=torch.float32) / 100.0).to(torch.bfloat16).contiguous()
+            legacy_output = torch.empty((qlen, hidden_size), dtype=torch.bfloat16).contiguous()
+            fused_output = torch.empty((qlen, hidden_size), dtype=torch.bfloat16).contiguous()
+            bsz_tensor = torch.tensor([qlen], dtype=torch.int32)
+
+            cpu_infer.submit(
+                legacy_moe.forward_task(
+                    bsz_tensor.data_ptr(),
+                    num_experts_per_tok,
+                    expert_ids.data_ptr(),
+                    weights.data_ptr(),
+                    input_data.data_ptr(),
+                    legacy_output.data_ptr(),
+                    False,
+                )
+            )
+            cpu_infer.sync()
+            cpu_infer.submit(
+                fused_moe.forward_task(
+                    bsz_tensor.data_ptr(),
+                    num_experts_per_tok,
+                    expert_ids.data_ptr(),
+                    weights.data_ptr(),
+                    input_data.data_ptr(),
+                    fused_output.data_ptr(),
+                    False,
+                )
+            )
+            cpu_infer.sync()
+
+            diff = torch.mean(torch.abs(fused_output.float() - legacy_output.float())) / (
+                torch.mean(torch.abs(legacy_output.float())) + 1e-8
+            )
+            print(f"  Fused vs legacy iteration {i}: diff = {diff.item():.6f}")
+            assert diff < 0.03, f"AVXVNNI fused decode mismatch: diff={diff.item():.6f}"
+
+
 def test_gptq_int4_accuracy():
     backends = available_backends()
     if not backends:
@@ -280,6 +390,14 @@ def test_gptq_int4_accuracy():
     for backend_name, backend_cls, threshold in backends:
         run_backend_accuracy_test(backend_name, backend_cls, threshold, qlen=1)
         run_backend_accuracy_test(backend_name, backend_cls, threshold, qlen=16)
+
+
+def test_avxvnni_fused_decode_matches_legacy():
+    if not hasattr(kt_kernel_ext.moe, "AVXVNNI256GPTQInt4_MOE"):
+        pytest.skip("AVXVNNI256GPTQInt4_MOE is not compiled in")
+    if not any(name == "AVXVNNI256GPTQInt4_MOE" for name, _, _ in available_backends()):
+        pytest.skip("CPU does not expose avx_vnni")
+    run_avxvnni_fused_vs_legacy_decode_test(kt_kernel_ext.moe.AVXVNNI256GPTQInt4_MOE)
 
 
 def test_gptq_int4_backend_selection_falls_back_to_avx2_for_large_group_size(monkeypatch):

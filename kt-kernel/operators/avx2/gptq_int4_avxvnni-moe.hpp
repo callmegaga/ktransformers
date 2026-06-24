@@ -19,12 +19,16 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
 #include <stdexcept>
+#include <vector>
 
 #include "avx2_bf16_utils.hpp"
 #include "moe_base.hpp"
@@ -239,6 +243,168 @@ static inline void gemm_gptq_sym_int4_avxvnni256(int m, int n, int k, GemmKernel
   }
 }
 
+static inline bool env_flag_enabled(const char* name, bool default_value) {
+  const char* value = std::getenv(name);
+  if (value == nullptr || value[0] == '\0') {
+    return default_value;
+  }
+
+  const char c0 = value[0];
+  const char c1 = value[1];
+  if (c0 == '0' || c0 == 'f' || c0 == 'F' || c0 == 'n' || c0 == 'N' ||
+      ((c0 == 'o' || c0 == 'O') && (c1 == 'f' || c1 == 'F'))) {
+    return false;
+  }
+  if (c0 == '1' || c0 == 't' || c0 == 'T' || c0 == 'y' || c0 == 'Y' ||
+      ((c0 == 'o' || c0 == 'O') && (c1 == 'n' || c1 == 'N'))) {
+    return true;
+  }
+  return default_value;
+}
+
+static inline uint64_t env_u64(const char* name, uint64_t default_value) {
+  const char* value = std::getenv(name);
+  if (value == nullptr || value[0] == '\0') {
+    return default_value;
+  }
+
+  char* end = nullptr;
+  const uint64_t parsed = std::strtoull(value, &end, 10);
+  if (end == value || parsed == 0) {
+    return default_value;
+  }
+  return parsed;
+}
+
+static inline void quantize_activation_groups_u8(const ggml_bf16_t* src, int num_groups, int group_size,
+                                                 uint8_t* dst, float* scales) {
+  for (int g = 0; g < num_groups; ++g) {
+    scales[g] = quantize_activation_group_u8(src + (size_t)g * group_size, group_size,
+                                             dst + (size_t)g * group_size);
+  }
+}
+
+static inline float silu_mul_scalar(float gate, float up) {
+  return gate * (1.0f / (1.0f + std::exp(-gate))) * up;
+}
+
+template <typename BufferB>
+KT_AVXVNNI256_TARGET
+static inline float dot_prequantized_u8_s8_avxvnni256(const uint8_t* a_u8, const float* a_scales,
+                                                      const BufferB& b, int ni) {
+  const int group_size = b.group_size;
+  float result = 0.0f;
+
+  for (int g = 0; g < b.num_groups; ++g) {
+    const float a_scale = a_scales[g];
+    if (a_scale == 0.0f) {
+      continue;
+    }
+
+    const int k_base = g * group_size;
+    const int8_t* w_col = b.qweight_s8 + (size_t)ni * b.k + k_base;
+    __m256i acc = _mm256_setzero_si256();
+    for (int kk = 0; kk < group_size; kk += 32) {
+      const __m256i a_vec = _mm256_loadu_si256((const __m256i*)(a_u8 + k_base + kk));
+      const __m256i w_vec = _mm256_loadu_si256((const __m256i*)(w_col + kk));
+      acc = _mm256_dpbusd_avx_epi32(acc, a_vec, w_vec);
+    }
+
+    const int dot = hsum_epi32_avx2(acc) - 128 * (int)b.weight_sums[g * b.n + ni];
+    result += (float)dot * a_scale * b.scales[g * b.n + ni];
+  }
+
+  return result;
+}
+
+template <typename BufferB>
+KT_AVXVNNI256_TARGET
+static inline void fused_gate_up_activation_avxvnni256(int intermediate_size, const uint8_t* input_u8,
+                                                       const float* input_scales,
+                                                       const BufferB& gate_b,
+                                                       const BufferB& up_b,
+                                                       ggml_bf16_t* activation_bf16, int ith, int nth) {
+  auto [n_start, n_end] = avx2::split_range(intermediate_size, ith, nth);
+  alignas(16) ggml_bf16_t gate_tmp[8];
+  alignas(16) ggml_bf16_t up_tmp[8];
+
+  int ni = n_start;
+  for (; ni + 8 <= n_end; ni += 8) {
+    for (int lane = 0; lane < 8; ++lane) {
+      const int col = ni + lane;
+      gate_tmp[lane] = GGML_FP32_TO_BF16(dot_prequantized_u8_s8_avxvnni256(input_u8, input_scales, gate_b, col));
+      up_tmp[lane] = GGML_FP32_TO_BF16(dot_prequantized_u8_s8_avxvnni256(input_u8, input_scales, up_b, col));
+    }
+
+    const __m256 gate_val = avx2::load_bf16_to_fp32(gate_tmp);
+    const __m256 up_val = avx2::load_bf16_to_fp32(up_tmp);
+    const __m256 result = avx2::act_fn(gate_val, up_val);
+    avx2::store_fp32_to_bf16(activation_bf16 + ni, result);
+  }
+
+  for (; ni < n_end; ++ni) {
+    const ggml_bf16_t gate = GGML_FP32_TO_BF16(dot_prequantized_u8_s8_avxvnni256(input_u8, input_scales, gate_b, ni));
+    const ggml_bf16_t up = GGML_FP32_TO_BF16(dot_prequantized_u8_s8_avxvnni256(input_u8, input_scales, up_b, ni));
+    activation_bf16[ni] = GGML_FP32_TO_BF16(silu_mul_scalar(GGML_BF16_TO_FP32(gate), GGML_BF16_TO_FP32(up)));
+  }
+}
+
+template <typename BufferB>
+KT_AVXVNNI256_TARGET
+static inline void fused_down_avxvnni256(int hidden_size, const uint8_t* activation_u8, const float* activation_scales,
+                                         const BufferB& down_b,
+                                         ggml_bf16_t* down_bf16, int ith, int nth) {
+  auto [n_start, n_end] = avx2::split_range(hidden_size, ith, nth);
+  alignas(32) float down_tmp[8];
+
+  int ni = n_start;
+  for (; ni + 8 <= n_end; ni += 8) {
+    for (int lane = 0; lane < 8; ++lane) {
+      down_tmp[lane] = dot_prequantized_u8_s8_avxvnni256(activation_u8, activation_scales, down_b, ni + lane);
+    }
+    avx2::store_fp32_to_bf16(down_bf16 + ni, _mm256_load_ps(down_tmp));
+  }
+
+  for (; ni < n_end; ++ni) {
+    down_bf16[ni] = GGML_FP32_TO_BF16(dot_prequantized_u8_s8_avxvnni256(activation_u8, activation_scales, down_b, ni));
+  }
+}
+
+template <typename BufferB>
+KT_AVXVNNI256_TARGET
+static inline void fused_down_weighted_sum_avxvnni256(int hidden_size, const uint8_t* const* activation_u8,
+                                                      const float* const* activation_scales,
+                                                      const BufferB* const* down_bs, const float* weights,
+                                                      int active_count, float* output, int ith, int nth) {
+  auto [n_start, n_end] = avx2::split_range(hidden_size, ith, nth);
+  alignas(16) ggml_bf16_t down_tmp[8];
+
+  int ni = n_start;
+  for (; ni + 8 <= n_end; ni += 8) {
+    __m256 acc = _mm256_setzero_ps();
+    for (int expert = 0; expert < active_count; ++expert) {
+      for (int lane = 0; lane < 8; ++lane) {
+        down_tmp[lane] = GGML_FP32_TO_BF16(dot_prequantized_u8_s8_avxvnni256(
+            activation_u8[expert], activation_scales[expert], *down_bs[expert], ni + lane));
+      }
+      const __m256 down = avx2::load_bf16_to_fp32(down_tmp);
+      const __m256 weight = _mm256_set1_ps(weights[expert]);
+      acc = _mm256_fmadd_ps(down, weight, acc);
+    }
+    _mm256_storeu_ps(output + ni, acc);
+  }
+
+  for (; ni < n_end; ++ni) {
+    float acc = 0.0f;
+    for (int expert = 0; expert < active_count; ++expert) {
+      const ggml_bf16_t down = GGML_FP32_TO_BF16(dot_prequantized_u8_s8_avxvnni256(
+          activation_u8[expert], activation_scales[expert], *down_bs[expert], ni));
+      acc += GGML_BF16_TO_FP32(down) * weights[expert];
+    }
+    output[ni] = acc;
+  }
+}
+
 }  // namespace avxvnni
 
 template <class T = avxvnni::GemmKernelAVXVNNI256GPTQInt4>
@@ -256,12 +422,110 @@ class AVXVNNI256_GPTQ_INT4_MOE_TP : public AVX2_MOE_BASE<T, AVXVNNI256_GPTQ_INT4
   using Base::up_bb_;
   using Base::up_bc_;
 
+  bool fused_decode_enabled_ = false;
+  int fused_hidden_groups_ = 0;
+  int fused_intermediate_groups_ = 0;
+  std::vector<uint8_t> fused_input_u8_;
+  std::vector<float> fused_input_scales_;
+  std::vector<uint8_t> fused_activation_u8_;
+  std::vector<float> fused_activation_scales_;
+  std::vector<const uint8_t*> fused_active_activation_u8_;
+  std::vector<const float*> fused_active_activation_scales_;
+  std::vector<const typename T::BufferB*> fused_active_down_b_;
+  std::vector<float> fused_active_weights_;
+
+  bool fused_profile_enabled_ = false;
+  uint64_t fused_profile_interval_ = 200;
+  uint64_t fused_profile_calls_ = 0;
+  uint64_t fused_profile_input_quant_us_ = 0;
+  uint64_t fused_profile_gate_up_us_ = 0;
+  uint64_t fused_profile_activation_quant_us_ = 0;
+  uint64_t fused_profile_down_merge_us_ = 0;
+  uint64_t fused_profile_total_us_ = 0;
+
+  void init_fused_decode() {
+    const int group_size = config_.quant_config.group_size;
+    const bool env_enabled = avxvnni::env_flag_enabled("KT_AVXVNNI_FUSED_MOE", true);
+    fused_profile_enabled_ = avxvnni::env_flag_enabled("KT_AVXVNNI_FUSED_MOE_PROFILE", false);
+    fused_profile_interval_ = avxvnni::env_u64("KT_AVXVNNI_FUSED_MOE_PROFILE_INTERVAL", 200);
+    const bool shape_supported = group_size > 0 && (config_.hidden_size % group_size) == 0 &&
+                                 (config_.intermediate_size % group_size) == 0;
+
+    fused_decode_enabled_ = env_enabled && shape_supported;
+    if (shape_supported) {
+      fused_hidden_groups_ = config_.hidden_size / group_size;
+      fused_intermediate_groups_ = config_.intermediate_size / group_size;
+      fused_input_u8_.resize((size_t)config_.hidden_size);
+      fused_input_scales_.resize((size_t)fused_hidden_groups_);
+      fused_activation_u8_.resize((size_t)config_.num_experts_per_tok * config_.intermediate_size);
+      fused_activation_scales_.resize((size_t)config_.num_experts_per_tok * fused_intermediate_groups_);
+      fused_active_activation_u8_.resize((size_t)config_.num_experts_per_tok);
+      fused_active_activation_scales_.resize((size_t)config_.num_experts_per_tok);
+      fused_active_down_b_.resize((size_t)config_.num_experts_per_tok);
+      fused_active_weights_.resize((size_t)config_.num_experts_per_tok);
+    }
+
+    printf("AVXVNNI256_GPTQ_INT4_MOE_TP %d fused_decode=%s (KT_AVXVNNI_FUSED_MOE=%s, profile=%s)\n",
+           tp_part_idx, fused_decode_enabled_ ? "on" : "off", env_enabled ? "on" : "off",
+           fused_profile_enabled_ ? "on" : "off");
+  }
+
+  bool fused_decode_request_supported(int k, const int64_t* expert_ids) const {
+    if (k > config_.num_experts_per_tok) {
+      return false;
+    }
+
+    for (int i = 0; i < k; ++i) {
+      if (config_.should_skip_expert(expert_ids[i])) {
+        continue;
+      }
+      for (int j = 0; j < i; ++j) {
+        if (!config_.should_skip_expert(expert_ids[j]) && expert_ids[i] == expert_ids[j]) {
+          return false;
+        }
+      }
+    }
+
+    return true;
+  }
+
+  void report_fused_profile(int active_count, uint64_t input_quant_us, uint64_t gate_up_us,
+                            uint64_t activation_quant_us, uint64_t down_merge_us, uint64_t total_us) {
+    if (!fused_profile_enabled_) {
+      return;
+    }
+
+    ++fused_profile_calls_;
+    fused_profile_input_quant_us_ += input_quant_us;
+    fused_profile_gate_up_us_ += gate_up_us;
+    fused_profile_activation_quant_us_ += activation_quant_us;
+    fused_profile_down_merge_us_ += down_merge_us;
+    fused_profile_total_us_ += total_us;
+
+    if (fused_profile_calls_ > 5 && (fused_profile_calls_ % fused_profile_interval_) != 0) {
+      return;
+    }
+
+    const double denom = (double)fused_profile_calls_;
+    printf("KT_AVXVNNI_FUSED_MOE_PROFILE layer=%d tp=%d call=%llu active=%d "
+           "last_us{input_quant=%llu gate_up=%llu activation_quant=%llu down_merge=%llu total=%llu} "
+           "avg_us{input_quant=%.1f gate_up=%.1f activation_quant=%.1f down_merge=%.1f total=%.1f}\n",
+           config_.layer_idx, tp_part_idx, (unsigned long long)fused_profile_calls_, active_count,
+           (unsigned long long)input_quant_us, (unsigned long long)gate_up_us,
+           (unsigned long long)activation_quant_us, (unsigned long long)down_merge_us,
+           (unsigned long long)total_us, fused_profile_input_quant_us_ / denom, fused_profile_gate_up_us_ / denom,
+           fused_profile_activation_quant_us_ / denom, fused_profile_down_merge_us_ / denom,
+           fused_profile_total_us_ / denom);
+  }
+
  public:
   using typename Base::input_t;
   using typename Base::output_t;
 
   AVXVNNI256_GPTQ_INT4_MOE_TP() = default;
-  AVXVNNI256_GPTQ_INT4_MOE_TP(GeneralMOEConfig config, int tp_part_idx_ = 0) : Base(config, tp_part_idx_) {}
+  AVXVNNI256_GPTQ_INT4_MOE_TP(GeneralMOEConfig config, int tp_part_idx_ = 0) : Base(config, tp_part_idx_) {
+    init_fused_decode();
+  }
 
   void derived_init() {
 #if defined(__GNUC__) || defined(__clang__)
@@ -281,6 +545,8 @@ class AVXVNNI256_GPTQ_INT4_MOE_TP : public AVX2_MOE_BASE<T, AVXVNNI256_GPTQ_INT4
   }
 
   ~AVXVNNI256_GPTQ_INT4_MOE_TP() = default;
+
+  GeneralMOEConfig& mutable_config() { return config_; }
 
   size_t buffer_a_required_size_impl(size_t m, size_t k) const { return T::BufferA::required_size(m, k); }
   size_t buffer_b_required_size_impl(size_t n, size_t k) const {
@@ -312,6 +578,132 @@ class AVXVNNI256_GPTQ_INT4_MOE_TP : public AVX2_MOE_BASE<T, AVXVNNI256_GPTQ_INT4
     int m = m_local_num_[expert_idx];
     avxvnni::gemm_gptq_sym_int4_avxvnni256(m, config_.hidden_size, config_.intermediate_size, *down_ba_[expert_idx],
                                           *down_bb_[expert_idx], *down_bc_[expert_idx], ith, nth);
+  }
+
+  void forward(int qlen, int k, const int64_t* expert_ids, const float* weights, const void* input, void* output) {
+    if (fused_decode_enabled_ && qlen == 1 && fused_decode_request_supported(k, expert_ids)) {
+      forward_decode_fused(k, expert_ids, weights, input, output);
+      return;
+    }
+    Base::forward(qlen, k, expert_ids, weights, input, output);
+  }
+
+  void forward_decode_fused(int k, const int64_t* expert_ids, const float* weights, const void* input, void* output) {
+    auto pool = config_.pool->get_subpool(tp_part_idx);
+    const int group_size = config_.quant_config.group_size;
+    const ggml_bf16_t* input_bf16 = (const ggml_bf16_t*)input;
+    using Clock = std::chrono::steady_clock;
+    Clock::time_point total_start;
+    Clock::time_point stage_start;
+    uint64_t input_quant_us = 0;
+    uint64_t gate_up_us = 0;
+    uint64_t activation_quant_us = 0;
+    uint64_t down_merge_us = 0;
+    uint64_t total_us = 0;
+    if (fused_profile_enabled_) {
+      total_start = Clock::now();
+      stage_start = total_start;
+    }
+
+    int activated_expert = 0;
+    std::fill(this->m_local_num_.begin(), this->m_local_num_.end(), 0);
+    for (int j = 0; j < k; ++j) {
+      if (config_.should_skip_expert(expert_ids[j])) {
+        continue;
+      }
+
+      const int expert_idx = (int)expert_ids[j];
+      this->m_expert_id_map_[activated_expert] = expert_idx;
+      this->m_local_pos_[0][j] = 0;
+      this->m_local_num_[expert_idx] = 1;
+      this->m_local_gate_output_ptr_[expert_idx] =
+          this->m_local_gate_output_ + (size_t)activated_expert * config_.intermediate_size;
+      this->m_local_down_output_ptr_[expert_idx] =
+          this->m_local_down_output_ + (size_t)activated_expert * config_.hidden_size;
+      fused_active_activation_u8_[activated_expert] =
+          fused_activation_u8_.data() + (size_t)activated_expert * config_.intermediate_size;
+      fused_active_activation_scales_[activated_expert] =
+          fused_activation_scales_.data() + (size_t)activated_expert * fused_intermediate_groups_;
+      fused_active_down_b_[activated_expert] = down_bb_[expert_idx].get();
+      fused_active_weights_[activated_expert] = weights[j];
+      ++activated_expert;
+    }
+
+    avxvnni::quantize_activation_groups_u8(input_bf16, fused_hidden_groups_, group_size, fused_input_u8_.data(),
+                                           fused_input_scales_.data());
+    if (fused_profile_enabled_) {
+      auto now = Clock::now();
+      input_quant_us = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(now - stage_start).count();
+      stage_start = now;
+    }
+
+    if (activated_expert > 0) {
+      const int gate_up_nth = T::recommended_nth(config_.intermediate_size);
+      pool->do_work_stealing_job(
+          gate_up_nth * activated_expert, [](int) { T::config(); },
+          [this, gate_up_nth](int task_id) {
+            const int active_idx = task_id / gate_up_nth;
+            const int ith = task_id % gate_up_nth;
+            const int expert_idx = this->m_expert_id_map_[active_idx];
+            ggml_bf16_t* activation_bf16 =
+                this->m_local_gate_output_ + (size_t)active_idx * this->config_.intermediate_size;
+
+            avxvnni::fused_gate_up_activation_avxvnni256(
+                this->config_.intermediate_size, this->fused_input_u8_.data(), this->fused_input_scales_.data(),
+                *this->gate_bb_[expert_idx], *this->up_bb_[expert_idx], activation_bf16, ith, gate_up_nth);
+          },
+          nullptr);
+    }
+
+    if (fused_profile_enabled_) {
+      auto now = Clock::now();
+      gate_up_us = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(now - stage_start).count();
+      stage_start = now;
+    }
+
+    if (activated_expert > 0) {
+      pool->do_work_stealing_job(
+          activated_expert, nullptr,
+          [this, group_size](int active_idx) {
+            ggml_bf16_t* activation_bf16 =
+                this->m_local_gate_output_ + (size_t)active_idx * this->config_.intermediate_size;
+            avxvnni::quantize_activation_groups_u8(activation_bf16, this->fused_intermediate_groups_, group_size,
+                                                   this->fused_activation_u8_.data() +
+                                                       (size_t)active_idx * this->config_.intermediate_size,
+                                                   this->fused_activation_scales_.data() +
+                                                       (size_t)active_idx * this->fused_intermediate_groups_);
+          },
+          nullptr);
+    }
+
+    float* out = (float*)output;
+    if (fused_profile_enabled_) {
+      auto now = Clock::now();
+      activation_quant_us = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(now - stage_start).count();
+      stage_start = now;
+    }
+
+    const int down_nth = T::recommended_nth(config_.hidden_size);
+    if (activated_expert > 0) {
+      pool->do_work_stealing_job(
+          down_nth, [](int) { T::config(); },
+          [this, out, activated_expert, down_nth](int ith) {
+            avxvnni::fused_down_weighted_sum_avxvnni256(
+                this->config_.hidden_size, this->fused_active_activation_u8_.data(),
+                this->fused_active_activation_scales_.data(), this->fused_active_down_b_.data(),
+                this->fused_active_weights_.data(), activated_expert, out, ith, down_nth);
+          },
+          nullptr);
+    } else {
+      std::fill(out, out + config_.hidden_size, 0.0f);
+    }
+
+    if (fused_profile_enabled_) {
+      auto now = Clock::now();
+      down_merge_us = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(now - stage_start).count();
+      total_us = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(now - total_start).count();
+      report_fused_profile(activated_expert, input_quant_us, gate_up_us, activation_quant_us, down_merge_us, total_us);
+    }
   }
 
   void load_weights() {
@@ -378,9 +770,9 @@ class AVXVNNI256_GPTQ_INT4_MOE_TP : public AVX2_MOE_BASE<T, AVXVNNI256_GPTQ_INT4
 };
 
 template <typename K>
-class TP_MOE<AVXVNNI256_GPTQ_INT4_MOE_TP<K>> : public TP_MOE<AVX2_MOE_BASE<K, AVXVNNI256_GPTQ_INT4_MOE_TP<K>>> {
+class TP_MOE<AVXVNNI256_GPTQ_INT4_MOE_TP<K>> : public TP_MOE_Common<AVXVNNI256_GPTQ_INT4_MOE_TP<K>> {
  public:
-  using Base = TP_MOE<AVX2_MOE_BASE<K, AVXVNNI256_GPTQ_INT4_MOE_TP<K>>>;
+  using Base = TP_MOE_Common<AVXVNNI256_GPTQ_INT4_MOE_TP<K>>;
   using Base::Base;
 
   void load_weights() override {
@@ -414,7 +806,7 @@ class TP_MOE<AVXVNNI256_GPTQ_INT4_MOE_TP<K>> : public TP_MOE<AVX2_MOE_BASE<K, AV
     const size_t full_down_sc_elems = (size_t)down_num_groups * full_hidden;
 
     pool->dispense_backend()->do_numa_job([&, this](int i) {
-      auto& tpc = tps[i]->config_;
+      auto& tpc = tps[i]->mutable_config();
       const int tp_intermediate = tpc.intermediate_size;
 
       const size_t tp_gate_up_qw_elems = (size_t)gate_up_k_packed * tp_intermediate;
@@ -502,7 +894,7 @@ class TP_MOE<AVXVNNI256_GPTQ_INT4_MOE_TP<K>> : public TP_MOE<AVX2_MOE_BASE<K, AV
     pool->dispense_backend()->do_numa_job([&, this](int i) { tps[i]->load_weights(); });
 
     pool->dispense_backend()->do_numa_job([&, this](int i) {
-      auto& tpc = tps[i]->config_;
+      auto& tpc = tps[i]->mutable_config();
       delete[] (uint32_t*)tpc.gate_proj;
       delete[] (uint32_t*)tpc.up_proj;
       delete[] (uint32_t*)tpc.down_proj;
@@ -526,6 +918,47 @@ class TP_MOE<AVXVNNI256_GPTQ_INT4_MOE_TP<K>> : public TP_MOE<AVX2_MOE_BASE<K, AV
     (void)w2_scale_ptrs;
     throw std::runtime_error("AVX-VNNI-256 GPTQ INT4 write_weight_scale_to_buffer not yet implemented");
   }
+
+  void merge_results(int qlen, void* output, bool incremental) override {
+    auto& config = this->config;
+    auto& tp_count = this->tp_count;
+    auto& local_output_numa = this->local_output_numa;
+    auto& tp_configs = this->tp_configs;
+
+    auto merge_fn = [this, output, incremental, &config, &tp_count, &local_output_numa, &tp_configs](int token_nth) {
+      float* merge_to = local_output_numa[0] + token_nth * tp_configs[0].hidden_size;
+      if (incremental) {
+        for (int e = 0; e < config.hidden_size; e += 16) {
+          __m256 x0, x1;
+          avx2::load_16xbf16_to_2x8xfp32((ggml_bf16_t*)output + token_nth * config.hidden_size + e, &x0, &x1);
+          *((__m256*)(merge_to + e)) = _mm256_add_ps(*((__m256*)(merge_to + e)), x0);
+          *((__m256*)(merge_to + e + 8)) = _mm256_add_ps(*((__m256*)(merge_to + e + 8)), x1);
+        }
+      }
+
+      for (int i = 1; i < tp_count; i++) {
+        float* merge_from = local_output_numa[i] + token_nth * tp_configs[i].hidden_size;
+        for (int e = 0; e < tp_configs[i].hidden_size; e += 8) {
+          *((__m256*)(merge_to + e)) = _mm256_add_ps(*((__m256*)(merge_to + e)), *((__m256*)(merge_from + e)));
+        }
+      }
+
+      for (int e = 0; e < config.hidden_size; e += 16) {
+        __m256 x0 = *(__m256*)(merge_to + e);
+        __m256 x1 = *(__m256*)(merge_to + e + 8);
+        avx2::store_2x8xfp32_to_16xbf16(&x0, &x1, (ggml_bf16_t*)output + token_nth * config.hidden_size + e);
+      }
+    };
+
+    auto pool = config.pool;
+    if (qlen < 10) {
+      for (int i = 0; i < qlen; i++) merge_fn(i);
+    } else {
+      pool->do_work_stealing_job(qlen, nullptr, merge_fn, nullptr);
+    }
+  }
+
+  void merge_results(int qlen, void* output) override { merge_results(qlen, output, false); }
 };
 
 #undef KT_AVXVNNI256_TARGET
