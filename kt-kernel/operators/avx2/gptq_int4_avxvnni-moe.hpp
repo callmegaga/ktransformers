@@ -319,6 +319,144 @@ static inline float dot_prequantized_u8_s8_avxvnni256(const uint8_t* a_u8, const
 
 template <typename BufferB>
 KT_AVXVNNI256_TARGET
+static inline void dot_gate_up_prequantized_u8_s8_x4_avxvnni256(const uint8_t* a_u8, const float* a_scales,
+                                                                const BufferB& gate_b, const BufferB& up_b, int ni,
+                                                                ggml_bf16_t* gate_out, ggml_bf16_t* up_out) {
+  const int group_size = gate_b.group_size;
+  float gate0 = 0.0f;
+  float gate1 = 0.0f;
+  float gate2 = 0.0f;
+  float gate3 = 0.0f;
+  float up0 = 0.0f;
+  float up1 = 0.0f;
+  float up2 = 0.0f;
+  float up3 = 0.0f;
+
+  for (int g = 0; g < gate_b.num_groups; ++g) {
+    const float a_scale = a_scales[g];
+    if (a_scale == 0.0f) {
+      continue;
+    }
+
+    const int k_base = g * group_size;
+    const int8_t* gate_w0 = gate_b.qweight_s8 + (size_t)(ni + 0) * gate_b.k + k_base;
+    const int8_t* gate_w1 = gate_b.qweight_s8 + (size_t)(ni + 1) * gate_b.k + k_base;
+    const int8_t* gate_w2 = gate_b.qweight_s8 + (size_t)(ni + 2) * gate_b.k + k_base;
+    const int8_t* gate_w3 = gate_b.qweight_s8 + (size_t)(ni + 3) * gate_b.k + k_base;
+    const int8_t* up_w0 = up_b.qweight_s8 + (size_t)(ni + 0) * up_b.k + k_base;
+    const int8_t* up_w1 = up_b.qweight_s8 + (size_t)(ni + 1) * up_b.k + k_base;
+    const int8_t* up_w2 = up_b.qweight_s8 + (size_t)(ni + 2) * up_b.k + k_base;
+    const int8_t* up_w3 = up_b.qweight_s8 + (size_t)(ni + 3) * up_b.k + k_base;
+
+    __m256i gate_acc0 = _mm256_setzero_si256();
+    __m256i gate_acc1 = _mm256_setzero_si256();
+    __m256i gate_acc2 = _mm256_setzero_si256();
+    __m256i gate_acc3 = _mm256_setzero_si256();
+    __m256i up_acc0 = _mm256_setzero_si256();
+    __m256i up_acc1 = _mm256_setzero_si256();
+    __m256i up_acc2 = _mm256_setzero_si256();
+    __m256i up_acc3 = _mm256_setzero_si256();
+
+    for (int kk = 0; kk < group_size; kk += 32) {
+      const __m256i a_vec = _mm256_loadu_si256((const __m256i*)(a_u8 + k_base + kk));
+      gate_acc0 = _mm256_dpbusd_avx_epi32(gate_acc0, a_vec, _mm256_loadu_si256((const __m256i*)(gate_w0 + kk)));
+      gate_acc1 = _mm256_dpbusd_avx_epi32(gate_acc1, a_vec, _mm256_loadu_si256((const __m256i*)(gate_w1 + kk)));
+      gate_acc2 = _mm256_dpbusd_avx_epi32(gate_acc2, a_vec, _mm256_loadu_si256((const __m256i*)(gate_w2 + kk)));
+      gate_acc3 = _mm256_dpbusd_avx_epi32(gate_acc3, a_vec, _mm256_loadu_si256((const __m256i*)(gate_w3 + kk)));
+      up_acc0 = _mm256_dpbusd_avx_epi32(up_acc0, a_vec, _mm256_loadu_si256((const __m256i*)(up_w0 + kk)));
+      up_acc1 = _mm256_dpbusd_avx_epi32(up_acc1, a_vec, _mm256_loadu_si256((const __m256i*)(up_w1 + kk)));
+      up_acc2 = _mm256_dpbusd_avx_epi32(up_acc2, a_vec, _mm256_loadu_si256((const __m256i*)(up_w2 + kk)));
+      up_acc3 = _mm256_dpbusd_avx_epi32(up_acc3, a_vec, _mm256_loadu_si256((const __m256i*)(up_w3 + kk)));
+    }
+
+    const int scale_base = g * gate_b.n + ni;
+    const float gate_scale0 = a_scale * gate_b.scales[scale_base + 0];
+    const float gate_scale1 = a_scale * gate_b.scales[scale_base + 1];
+    const float gate_scale2 = a_scale * gate_b.scales[scale_base + 2];
+    const float gate_scale3 = a_scale * gate_b.scales[scale_base + 3];
+    const float up_scale0 = a_scale * up_b.scales[scale_base + 0];
+    const float up_scale1 = a_scale * up_b.scales[scale_base + 1];
+    const float up_scale2 = a_scale * up_b.scales[scale_base + 2];
+    const float up_scale3 = a_scale * up_b.scales[scale_base + 3];
+
+    gate0 +=
+        (float)(hsum_epi32_avx2(gate_acc0) - 128 * (int)gate_b.weight_sums[scale_base + 0]) * gate_scale0;
+    gate1 +=
+        (float)(hsum_epi32_avx2(gate_acc1) - 128 * (int)gate_b.weight_sums[scale_base + 1]) * gate_scale1;
+    gate2 +=
+        (float)(hsum_epi32_avx2(gate_acc2) - 128 * (int)gate_b.weight_sums[scale_base + 2]) * gate_scale2;
+    gate3 +=
+        (float)(hsum_epi32_avx2(gate_acc3) - 128 * (int)gate_b.weight_sums[scale_base + 3]) * gate_scale3;
+    up0 += (float)(hsum_epi32_avx2(up_acc0) - 128 * (int)up_b.weight_sums[scale_base + 0]) * up_scale0;
+    up1 += (float)(hsum_epi32_avx2(up_acc1) - 128 * (int)up_b.weight_sums[scale_base + 1]) * up_scale1;
+    up2 += (float)(hsum_epi32_avx2(up_acc2) - 128 * (int)up_b.weight_sums[scale_base + 2]) * up_scale2;
+    up3 += (float)(hsum_epi32_avx2(up_acc3) - 128 * (int)up_b.weight_sums[scale_base + 3]) * up_scale3;
+  }
+
+  gate_out[0] = GGML_FP32_TO_BF16(gate0);
+  gate_out[1] = GGML_FP32_TO_BF16(gate1);
+  gate_out[2] = GGML_FP32_TO_BF16(gate2);
+  gate_out[3] = GGML_FP32_TO_BF16(gate3);
+  up_out[0] = GGML_FP32_TO_BF16(up0);
+  up_out[1] = GGML_FP32_TO_BF16(up1);
+  up_out[2] = GGML_FP32_TO_BF16(up2);
+  up_out[3] = GGML_FP32_TO_BF16(up3);
+}
+
+template <typename BufferB>
+KT_AVXVNNI256_TARGET
+static inline void dot_prequantized_u8_s8_x4_bf16_avxvnni256(const uint8_t* a_u8, const float* a_scales,
+                                                             const BufferB& b, int ni, ggml_bf16_t* out) {
+  const int group_size = b.group_size;
+  float out0 = 0.0f;
+  float out1 = 0.0f;
+  float out2 = 0.0f;
+  float out3 = 0.0f;
+
+  for (int g = 0; g < b.num_groups; ++g) {
+    const float a_scale = a_scales[g];
+    if (a_scale == 0.0f) {
+      continue;
+    }
+
+    const int k_base = g * group_size;
+    const int8_t* w0 = b.qweight_s8 + (size_t)(ni + 0) * b.k + k_base;
+    const int8_t* w1 = b.qweight_s8 + (size_t)(ni + 1) * b.k + k_base;
+    const int8_t* w2 = b.qweight_s8 + (size_t)(ni + 2) * b.k + k_base;
+    const int8_t* w3 = b.qweight_s8 + (size_t)(ni + 3) * b.k + k_base;
+
+    __m256i acc0 = _mm256_setzero_si256();
+    __m256i acc1 = _mm256_setzero_si256();
+    __m256i acc2 = _mm256_setzero_si256();
+    __m256i acc3 = _mm256_setzero_si256();
+
+    for (int kk = 0; kk < group_size; kk += 32) {
+      const __m256i a_vec = _mm256_loadu_si256((const __m256i*)(a_u8 + k_base + kk));
+      acc0 = _mm256_dpbusd_avx_epi32(acc0, a_vec, _mm256_loadu_si256((const __m256i*)(w0 + kk)));
+      acc1 = _mm256_dpbusd_avx_epi32(acc1, a_vec, _mm256_loadu_si256((const __m256i*)(w1 + kk)));
+      acc2 = _mm256_dpbusd_avx_epi32(acc2, a_vec, _mm256_loadu_si256((const __m256i*)(w2 + kk)));
+      acc3 = _mm256_dpbusd_avx_epi32(acc3, a_vec, _mm256_loadu_si256((const __m256i*)(w3 + kk)));
+    }
+
+    const int scale_base = g * b.n + ni;
+    out0 += (float)(hsum_epi32_avx2(acc0) - 128 * (int)b.weight_sums[scale_base + 0]) *
+            (a_scale * b.scales[scale_base + 0]);
+    out1 += (float)(hsum_epi32_avx2(acc1) - 128 * (int)b.weight_sums[scale_base + 1]) *
+            (a_scale * b.scales[scale_base + 1]);
+    out2 += (float)(hsum_epi32_avx2(acc2) - 128 * (int)b.weight_sums[scale_base + 2]) *
+            (a_scale * b.scales[scale_base + 2]);
+    out3 += (float)(hsum_epi32_avx2(acc3) - 128 * (int)b.weight_sums[scale_base + 3]) *
+            (a_scale * b.scales[scale_base + 3]);
+  }
+
+  out[0] = GGML_FP32_TO_BF16(out0);
+  out[1] = GGML_FP32_TO_BF16(out1);
+  out[2] = GGML_FP32_TO_BF16(out2);
+  out[3] = GGML_FP32_TO_BF16(out3);
+}
+
+template <typename BufferB>
+KT_AVXVNNI256_TARGET
 static inline void fused_gate_up_activation_avxvnni256(int intermediate_size, const uint8_t* input_u8,
                                                        const float* input_scales,
                                                        const BufferB& gate_b,
@@ -330,11 +468,9 @@ static inline void fused_gate_up_activation_avxvnni256(int intermediate_size, co
 
   int ni = n_start;
   for (; ni + 8 <= n_end; ni += 8) {
-    for (int lane = 0; lane < 8; ++lane) {
-      const int col = ni + lane;
-      gate_tmp[lane] = GGML_FP32_TO_BF16(dot_prequantized_u8_s8_avxvnni256(input_u8, input_scales, gate_b, col));
-      up_tmp[lane] = GGML_FP32_TO_BF16(dot_prequantized_u8_s8_avxvnni256(input_u8, input_scales, up_b, col));
-    }
+    dot_gate_up_prequantized_u8_s8_x4_avxvnni256(input_u8, input_scales, gate_b, up_b, ni, gate_tmp, up_tmp);
+    dot_gate_up_prequantized_u8_s8_x4_avxvnni256(input_u8, input_scales, gate_b, up_b, ni + 4, gate_tmp + 4,
+                                                 up_tmp + 4);
 
     const __m256 gate_val = avx2::load_bf16_to_fp32(gate_tmp);
     const __m256 up_val = avx2::load_bf16_to_fp32(up_tmp);
@@ -383,10 +519,10 @@ static inline void fused_down_weighted_sum_avxvnni256(int hidden_size, const uin
   for (; ni + 8 <= n_end; ni += 8) {
     __m256 acc = _mm256_setzero_ps();
     for (int expert = 0; expert < active_count; ++expert) {
-      for (int lane = 0; lane < 8; ++lane) {
-        down_tmp[lane] = GGML_FP32_TO_BF16(dot_prequantized_u8_s8_avxvnni256(
-            activation_u8[expert], activation_scales[expert], *down_bs[expert], ni + lane));
-      }
+      dot_prequantized_u8_s8_x4_bf16_avxvnni256(activation_u8[expert], activation_scales[expert], *down_bs[expert],
+                                                ni, down_tmp);
+      dot_prequantized_u8_s8_x4_bf16_avxvnni256(activation_u8[expert], activation_scales[expert], *down_bs[expert],
+                                                ni + 4, down_tmp + 4);
       const __m256 down = avx2::load_bf16_to_fp32(down_tmp);
       const __m256 weight = _mm256_set1_ps(weights[expert]);
       acc = _mm256_fmadd_ps(down, weight, acc);
