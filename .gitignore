@@ -32,3 +32,4 @@ kvc2/
 sched/
 *.png
 perf-log/
+doc/zh/report
