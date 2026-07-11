@@ -26,18 +26,23 @@ option(KTRANSFORMERS_CPU_MLA "ktransformers: CPU use MLA" OFF)
 option(KTRANSFORMERS_CPU_MOE_KERNEL "ktransformers: CPU use moe kernel" OFF)
 option(KTRANSFORMERS_CPU_MOE_AMD "ktransformers: CPU use moe kernel for amd" OFF)
 option(KTRANSFORMERS_ENABLE_CPPTRACE "Enable native crash tracing in kt-kernel" OFF)
+option(KTRANSFORMERS_ADD_SYCL "ktransformers: build experimental SYCL FP8 MoE backend" OFF)
 # LTO control
 option(CPUINFER_ENABLE_LTO "Enable link time optimization (IPO)" OFF)
 
-project(kt_kernel_ext VERSION 0.6.1)
-
-# Auto-detect CPU features early (unless building with LLAMA_NATIVE)
-if(NOT LLAMA_NATIVE AND NOT MSVC)
-    include(cmake/DetectCPU.cmake)
-endif()
-
 # Choose compilers BEFORE project() so CMake honors them
-if(USE_CONDA_TOOLCHAIN)
+if(KTRANSFORMERS_ADD_SYCL)
+    find_program(SYCL_CXX_COMPILER NAMES icpx dpcpp)
+    if(NOT SYCL_CXX_COMPILER)
+        message(FATAL_ERROR "KTRANSFORMERS_ADD_SYCL=ON but no SYCL C++ compiler was found (expected icpx or dpcpp).")
+    endif()
+    find_program(SYCL_C_COMPILER NAMES icx clang gcc)
+    if(SYCL_C_COMPILER)
+        set(CMAKE_C_COMPILER ${SYCL_C_COMPILER} CACHE FILEPATH "C compiler" FORCE)
+    endif()
+    set(CMAKE_CXX_COMPILER ${SYCL_CXX_COMPILER} CACHE FILEPATH "C++ compiler" FORCE)
+    message(STATUS "SYCL enabled: using CXX compiler ${SYCL_CXX_COMPILER}")
+elseif(USE_CONDA_TOOLCHAIN)
     if(NOT DEFINED ENV{CONDA_PREFIX} OR NOT EXISTS "$ENV{CONDA_PREFIX}")
         message(FATAL_ERROR "USE_CONDA_TOOLCHAIN=ON but CONDA_PREFIX is not set. Activate your conda env or pass -DCONDA_PREFIX=/path")
     endif()
@@ -55,6 +60,13 @@ else()
         set(CMAKE_C_COMPILER   "/usr/bin/gcc" CACHE FILEPATH "C compiler" FORCE)
         set(CMAKE_CXX_COMPILER "/usr/bin/g++" CACHE FILEPATH "C++ compiler" FORCE)
     endif()
+endif()
+
+project(kt_kernel_ext VERSION 0.6.1)
+
+# Auto-detect CPU features early (unless building with LLAMA_NATIVE)
+if(NOT LLAMA_NATIVE AND NOT MSVC)
+    include(cmake/DetectCPU.cmake)
 endif()
 
 
@@ -503,6 +515,8 @@ elseif(KTRANSFORMERS_USE_MACA)
     add_compile_definitions(KTRANSFORMERS_USE_MACA=1)
 elseif(KTRANSFORMERS_CPU_USE_KML)
     message(STATUS "KML CPU detected")
+elseif(KTRANSFORMERS_ADD_SYCL)
+    message(STATUS "SYCL support enabled")
 else()
     message(STATUS "No GPU support enabled, building for CPU only")
     add_compile_definitions(KTRANSFORMERS_CPU_ONLY=1)
@@ -630,6 +644,35 @@ else()
     set(CMAKE_INTERPROCEDURAL_OPTIMIZATION OFF)
     pybind11_add_module(${PROJECT_NAME} MODULE ${ALL_SOURCES})
     message(STATUS "LTO: disabled")
+endif()
+
+if(KTRANSFORMERS_ADD_SYCL)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE USE_SYCL=1)
+    target_compile_options(${PROJECT_NAME} PRIVATE
+        "$<$<COMPILE_LANGUAGE:CXX>:-fsycl>"
+        "$<$<COMPILE_LANGUAGE:CXX>:-fsycl-targets=spir64>"
+        "$<$<COMPILE_LANGUAGE:CXX>:-fp-model=precise>"  # icpx defaults to fast-math; keep IEEE
+    )
+    target_link_options(${PROJECT_NAME} PRIVATE -fsycl -fsycl-targets=spir64)
+
+    # CRITICAL: keep CUDA host-stream support enabled alongside SYCL.
+    # CPUInfer::submit_with_cuda_stream / sync_with_cuda_stream (cpuinfer.h) only have a
+    # real body under KTRANSFORMERS_USE_CUDA/MUSA/ROCM/MACA. experts_base.py calls them
+    # unconditionally to schedule + await the expert compute on the CUDA stream. If SYCL
+    # is enabled *without* a GPU backend, they compile to empty no-ops -> expert output is
+    # never computed/synced -> garbage tokens. SYCL must be ADDITIVE to CUDA, not exclusive.
+    find_package(CUDAToolkit QUIET)
+    if(CUDAToolkit_FOUND)
+        target_compile_definitions(${PROJECT_NAME} PRIVATE KTRANSFORMERS_USE_CUDA=1 USE_CUDA=1)
+        target_include_directories(${PROJECT_NAME} PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+        target_link_libraries(${PROJECT_NAME} PRIVATE CUDA::cudart)
+        message(STATUS "SYCL build: CUDA host-stream support ENABLED (cudart ${CUDAToolkit_VERSION})")
+    else()
+        message(FATAL_ERROR "SYCL build requires the CUDA toolkit for CPUInfer::submit_with_cuda_stream "
+                            "(set CUDAToolkit_ROOT=/usr/local/cuda). Without it the expert compute is never "
+                            "scheduled and the model emits garbage.")
+    endif()
+    message(STATUS "SYCL FP8 MoE backend: enabled (additive to CUDA, fp-model=precise)")
 endif()
 
 if(KTRANSFORMERS_ENABLE_CPPTRACE)

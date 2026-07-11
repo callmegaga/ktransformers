@@ -190,6 +190,7 @@ Simply run the install script - it will auto-detect your CPU and optimize for be
 | **RAWINT4** | AVX512F + AVX512BW | Intel Skylake-X (2017+), Ice Lake, Cascade Lake | Software fallbacks for VNNI/BF16 |
 | **AMXINT4/INT8** | AMX | Intel Sapphire Rapids (2023+) | Best performance, requires AMX hardware |
 | **FP8** | AVX512F + AVX512BW + AVX512_BF16 + AVX512_VBMI | Intel Cooper Lake (2020+), Sapphire Rapids (2023+); AMD Zen 4+ (e.g., EPYC 9355) | Native Precision (e.g., DeepSeek V3.2, MiniMax M2.1) |
+| **SYCL_FP8** | Intel oneAPI SYCL + GPU device | Intel integrated/discrete GPU visible to `sycl-ls` | Experimental FP8 expert GEMM backend for AVX2/iGPU comparison |
 | **BF16** | AVX512F + AVX512BW + AVX512_BF16 | Intel Cooper Lake (2020+), Sapphire Rapids (2023+); AMD Zen 4+ (e.g., EPYC 9355) | Native Precision (e.g., Qwen3-235B-A22B, GLM-4.7) |
 
 **Software Fallback Support (AVX512 backends):**
@@ -497,7 +498,7 @@ python -m sglang.launch_server \
 
 | Parameter | Description | Example Value |
 |-----------|-------------|---------------|
-| `--kt-method` | CPU inference backend method | `AMXINT4`, `AMXINT8`, `RAWINT4`, `FP8`, `FP8_PERCHANNEL`, `BF16` or `LLAMAFILE` |
+| `--kt-method` | CPU inference backend method | `AMXINT4`, `AMXINT8`, `RAWINT4`, `FP8`, `SYCL_FP8`, `FP8_PERCHANNEL`, `BF16` or `LLAMAFILE` |
 | `--kt-weight-path` | Path to quantized CPU weights | `/path/to/cpu-weights` |
 | `--kt-cpuinfer` | Number of CPU inference threads | `64` (adjust based on CPU cores) |
 | `--kt-threadpool-count` | Number of thread pools for parallel execution | `2` (typically 1-4) |
@@ -514,6 +515,7 @@ python -m sglang.launch_server \
   - `AMXINT8`: Higher accuracy with INT8 quantized weights on AMX CPUs
   - `RAWINT4`: Native INT4 weights shared by CPU and GPU (currently supports Kimi-K2-Thinking model). See [Kimi-K2-Thinking Native Tutorial](../doc/en/kt-kernel/Kimi-K2-Thinking-Native.md) for details.
   - `FP8`, `FP8_PERCHANNEL`: FP8 weights shared by CPU and GPU
+  - `SYCL_FP8`: Experimental FP8 backend that offloads expert GEMMs to a SYCL device. Build with `CPUINFER_USE_SYCL=1`.
   - `BF16`: BF16 weights shared by CPU and GPU
   - `LLAMAFILE`: GGUF-based backend
 
@@ -681,6 +683,7 @@ If you prefer manual installation without the `install.sh` script:
 | `CPUINFER_BUILD_TYPE` | `Release`, `Debug`, `RelWithDebInfo` | Build type (default: `Release`) |
 | `CPUINFER_PARALLEL` | Number | Parallel build jobs (default: auto-detect) |
 | `CPUINFER_VERBOSE` | `0`, `1` | Verbose build output (default: `0`) |
+| `CPUINFER_USE_SYCL` | `0`, `1` | Build experimental `SYCL_FP8` backend with oneAPI `icpx` |
 
 **Instruction Set Details:**
 
@@ -709,7 +712,16 @@ export CPUINFER_ENABLE_AMX=OFF
 # Debug build
 export CPUINFER_BUILD_TYPE=Debug
 export CPUINFER_VERBOSE=1
+
+# Experimental SYCL FP8 backend
+source /opt/intel/oneapi/setvars.sh
+export CPUINFER_USE_SYCL=1
+export CPUINFER_USE_CUDA=0
+export CPUINFER_CPU_INSTRUCT=AVX2
+pip install -e .
 ```
+
+For `SYCL_FP8`, the runtime selects a GPU by default. Use `KT_SYCL_DEVICE_FILTER=level_zero:gpu` to force Intel iGPU, or `KT_SYCL_DEVICE_FILTER=opencl:cpu` for correctness testing. If `sycl-ls` does not list the Intel GPU, check `/dev/dri/renderD*` permissions and add the user to the `render` group.
 
 #### 3. Build and Install
 

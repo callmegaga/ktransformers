@@ -1,4 +1,5 @@
 import gc
+import glob
 import logging
 import os
 import torch
@@ -31,6 +32,7 @@ AMXBF16_MOE = getattr(_moe_mod, "AMXBF16_MOE", None)
 AMXFP8PerChannel_MOE = getattr(_moe_mod, "AMXFP8PerChannel_MOE", None)
 AVX2BF16_MOE = getattr(_moe_mod, "AVX2BF16_MOE", None)
 AVX2FP8_MOE = getattr(_moe_mod, "AVX2FP8_MOE", None)
+SYCLFP8_MOE = getattr(_moe_mod, "SYCLFP8_MOE", None)
 AVX2GPTQInt4_MOE = getattr(_moe_mod, "AVX2GPTQInt4_MOE", None)
 AVX2RawInt4_MOE = getattr(_moe_mod, "AVX2RawInt4_MOE", None)
 AVX2MXFP4_MOE = getattr(_moe_mod, "AVX2MXFP4_MOE", None)
@@ -48,6 +50,7 @@ _HAS_BF16_SUPPORT = AMXBF16_MOE is not None
 _HAS_FP8_PERCHANNEL_SUPPORT = AMXFP8PerChannel_MOE is not None
 _HAS_AVX2_BF16_SUPPORT = AVX2BF16_MOE is not None
 _HAS_AVX2_FP8_SUPPORT = AVX2FP8_MOE is not None
+_HAS_SYCL_FP8_SUPPORT = SYCLFP8_MOE is not None
 _HAS_AVX2_GPTQ_INT4_SUPPORT = AVX2GPTQInt4_MOE is not None
 _HAS_AVX2_RAWINT4_SUPPORT = AVX2RawInt4_MOE is not None
 _HAS_AVX2_MXFP4_SUPPORT = AVX2MXFP4_MOE is not None
@@ -71,6 +74,21 @@ def _host_has_cpu_flag(*flag_names: str) -> bool:
 
 
 _HOST_HAS_AVX_VNNI = _host_has_cpu_flag("avx_vnni", "avxvnni")
+
+
+def _preflight_sycl_fp8_device():
+    """Catch the common no-iGPU-permission case before C++ worker threads construct the backend."""
+    if os.getenv("KT_SYCL_DEVICE_FILTER", "").strip():
+        return
+
+    render_nodes = sorted(glob.glob("/dev/dri/renderD*"))
+    if render_nodes and not any(os.access(path, os.R_OK | os.W_OK) for path in render_nodes):
+        raise RuntimeError(
+            "SYCL_FP8 selects a GPU device by default, but the current user cannot access "
+            "/dev/dri/renderD*. Add the user to the render group and re-login, or set "
+            "KT_SYCL_DEVICE_FILTER=opencl:cpu for correctness testing. Use "
+            "KT_SYCL_DEVICE_FILTER=level_zero:gpu to force Intel iGPU once sycl-ls lists it."
+        )
 
 
 def _supports_avxvnni256_gptq_int4_group_size(group_size: Optional[int]) -> bool:
@@ -521,7 +539,7 @@ class AMXMoEWrapper(BaseMoEWrapper):
 
 
 class NativeMoEWrapper(BaseMoEWrapper):
-    """Wrapper for RAWINT4/FP8/FP8_PERCHANNEL/BF16 experts stored in compressed SafeTensor format."""
+    """Wrapper for RAWINT4/FP8/SYCL_FP8/FP8_PERCHANNEL/BF16 experts stored in compressed SafeTensor format."""
 
     _native_loader_instance = None
 
@@ -570,6 +588,11 @@ class NativeMoEWrapper(BaseMoEWrapper):
                 "  - AVX512F + AVX512BW + AVX512_BF16 + AVX512_VBMI (for AMX), or\n"
                 "  - AVX2 + FMA (for AVX2 fallback)\n"
                 "Please recompile kt_kernel_ext with AVX512 + BF16 + VBMI enabled."
+            )
+        if method == "SYCL_FP8" and not _HAS_SYCL_FP8_SUPPORT:
+            raise RuntimeError(
+                "SYCL_FP8 backend not available. Recompile kt_kernel_ext with "
+                "CPUINFER_USE_SYCL=1 (or -DKTRANSFORMERS_ADD_SYCL=ON) using a SYCL compiler such as icpx."
             )
         if method == "FP8_PERCHANNEL" and not _HAS_FP8_PERCHANNEL_SUPPORT:
             raise RuntimeError(
@@ -638,7 +661,7 @@ class NativeMoEWrapper(BaseMoEWrapper):
     def _create_loader(method: str, weight_path: str):
         if method == "RAWINT4":
             return CompressedSafeTensorLoader(weight_path)
-        elif method == "FP8":
+        elif method in ("FP8", "SYCL_FP8"):
             return FP8SafeTensorLoader(weight_path)
         elif method == "FP8_PERCHANNEL":
             return FP8SafeTensorLoader(weight_path, scale_suffix="weight_scale")
@@ -660,13 +683,11 @@ class NativeMoEWrapper(BaseMoEWrapper):
             NativeMoEWrapper._native_loader_instance = None
             if layer_idx >= 0:
                 logger.info(
-                    "[KT] Released NativeMoEWrapper loader after layer %d: "
-                    "safetensors mmap handles freed.", layer_idx,
+                    "[KT] Released NativeMoEWrapper loader after layer %d: " "safetensors mmap handles freed.",
+                    layer_idx,
                 )
             else:
-                logger.info(
-                    "[KT] Released NativeMoEWrapper loader: safetensors mmap handles freed."
-                )
+                logger.info("[KT] Released NativeMoEWrapper loader: safetensors mmap handles freed.")
 
     @staticmethod
     def force_release_loader():
@@ -686,14 +707,13 @@ class NativeMoEWrapper(BaseMoEWrapper):
 
         if NativeMoEWrapper._native_loader_instance is None:
             t_recreate_start = time.time()
-            NativeMoEWrapper._native_loader_instance = NativeMoEWrapper._create_loader(
-                self.method, self.weight_path
-            )
+            NativeMoEWrapper._native_loader_instance = NativeMoEWrapper._create_loader(self.method, self.weight_path)
             self.loader = NativeMoEWrapper._native_loader_instance
             t_recreate_elapsed = (time.time() - t_recreate_start) * 1000
             logger.info(
                 "[KT] Recreated NativeMoEWrapper loader for layer %d (took %.1fms)",
-                self.layer_idx, t_recreate_elapsed,
+                self.layer_idx,
+                t_recreate_elapsed,
             )
         else:
             self.loader = NativeMoEWrapper._native_loader_instance
@@ -712,9 +732,7 @@ class NativeMoEWrapper(BaseMoEWrapper):
             except (ValueError, KeyError):
                 continue
         if weights is None:
-            raise ValueError(
-                f"No experts found for layer {self.layer_idx} under any prefix: {_candidates}"
-            )
+            raise ValueError(f"No experts found for layer {self.layer_idx} under any prefix: {_candidates}")
         t1 = time.time()
 
         # Keep individual tensors instead of stacking - avoid expensive memory copy
@@ -739,12 +757,12 @@ class NativeMoEWrapper(BaseMoEWrapper):
             self.down_scales = weights["down_scale"]
             if self.method == "RAWINT4":
                 assert self.gate_scales[0].dtype == torch.bfloat16, "Expected bf16 scales for RAWINT4"
-            elif self.method == "FP8":
+            elif self.method in ("FP8", "SYCL_FP8"):
                 if self.gate_scales[0].dtype != torch.float32:
                     self.gate_scales = [t.to(torch.float32).contiguous() for t in weights["gate_scale"]]
                     self.up_scales = [t.to(torch.float32).contiguous() for t in weights["up_scale"]]
                     self.down_scales = [t.to(torch.float32).contiguous() for t in weights["down_scale"]]
-                assert self.gate_scales[0].dtype == torch.float32, "Expected float32 scales for FP8"
+                assert self.gate_scales[0].dtype == torch.float32, f"Expected float32 scales for {self.method}"
             elif self.method == "FP8_PERCHANNEL":
                 if self.gate_scales[0].dtype != torch.float32:
                     self.gate_scales = [t.to(torch.float32).contiguous() for t in weights["gate_scale"]]
@@ -866,6 +884,12 @@ class NativeMoEWrapper(BaseMoEWrapper):
                 self.moe = AMXFP8_MOE(moe_config)
             else:
                 self.moe = AVX2FP8_MOE(moe_config)
+        elif self.method == "SYCL_FP8":
+            moe_config.quant_config.bits = 8
+            moe_config.quant_config.group_size = 128
+            moe_config.quant_config.zero_point = False
+            _preflight_sycl_fp8_device()
+            self.moe = SYCLFP8_MOE(moe_config)
         elif self.method == "FP8_PERCHANNEL":
             moe_config.quant_config.bits = 8
             moe_config.quant_config.per_channel = True

@@ -69,8 +69,8 @@
 
 #endif
 
-constexpr ggml_type GGML_TYPE_Q8_0_X4 = static_cast<ggml_type>(98);
-constexpr ggml_type GGML_TYPE_Q8_1_X4 = static_cast<ggml_type>(99);
+static const ggml_type GGML_TYPE_Q8_0_X4 = static_cast<ggml_type>(98);
+static const ggml_type GGML_TYPE_Q8_1_X4 = static_cast<ggml_type>(99);
 
 
 namespace {
