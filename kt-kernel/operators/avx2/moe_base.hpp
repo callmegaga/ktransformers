@@ -35,6 +35,87 @@
 #include "avx2_bf16_utils.hpp"
 #include "llama.cpp/ggml.h"
 
+namespace avx2_moe_detail {
+
+inline int env_int(const char* name, int fallback = 0) {
+  const char* v = std::getenv(name);
+  if (v == nullptr || v[0] == '\0') return fallback;
+  char* end = nullptr;
+  long parsed = std::strtol(v, &end, 10);
+  return end == v ? fallback : (int)parsed;
+}
+
+inline bool env_flag(const char* name, bool fallback = false) {
+  const char* v = std::getenv(name);
+  if (v == nullptr || v[0] == '\0') return fallback;
+  return !(std::strcmp(v, "0") == 0 || std::strcmp(v, "false") == 0 || std::strcmp(v, "FALSE") == 0 ||
+           std::strcmp(v, "off") == 0 || std::strcmp(v, "OFF") == 0);
+}
+
+inline int decode_trace_every() {
+  const int explicit_every = env_int("KT_MOE_DECODE_TRACE_EVERY", -1);
+  if (explicit_every >= 0) return explicit_every;
+  if (env_flag("KT_MOE_DECODE_TIMING", false)) return env_int("KT_SYCL_INT4_TRACE_EVERY", 50);
+  return env_int("KT_SYCL_INT4_TRACE_EVERY", 0);
+}
+
+inline uint64_t now_us() {
+  return (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
+struct DecodeTimingState {
+  uint64_t calls = 0;
+  uint64_t total_us = 0;
+  uint64_t setup_us = 0;
+  uint64_t pack_us = 0;
+  uint64_t gate_up_us = 0;
+  uint64_t activation_us = 0;
+  uint64_t down_pack_us = 0;
+  uint64_t down_us = 0;
+  uint64_t merge_us = 0;
+  uint64_t active_sum = 0;
+  uint64_t gate_up_fused_sum = 0;
+};
+
+inline DecodeTimingState& decode_timing_state(int layer_idx) {
+  static DecodeTimingState states[256];
+  return states[std::clamp(layer_idx, 0, 255)];
+}
+
+inline void trace_decode_timing(int layer_idx, int trace_every, int active_experts, bool gate_up_fused,
+                                uint64_t setup_us, uint64_t pack_us, uint64_t gate_up_us,
+                                uint64_t activation_us, uint64_t down_pack_us, uint64_t down_us,
+                                uint64_t merge_us, uint64_t total_us) {
+  if (trace_every <= 0) return;
+  DecodeTimingState& s = decode_timing_state(layer_idx);
+  s.calls++;
+  s.total_us += total_us;
+  s.setup_us += setup_us;
+  s.pack_us += pack_us;
+  s.gate_up_us += gate_up_us;
+  s.activation_us += activation_us;
+  s.down_pack_us += down_pack_us;
+  s.down_us += down_us;
+  s.merge_us += merge_us;
+  s.active_sum += (uint64_t)std::max(active_experts, 0);
+  s.gate_up_fused_sum += gate_up_fused ? 1 : 0;
+  if ((s.calls % (uint64_t)trace_every) != 0) return;
+  const double inv = 1.0 / (double)s.calls;
+  std::printf(
+      "[MOE decode] layer=%d calls=%llu avg_total=%.3fms avg_setup=%.3fms avg_pack=%.3fms "
+      "avg_gate_up=%.3fms avg_activation=%.3fms avg_down_pack=%.3fms avg_down=%.3fms avg_merge=%.3fms "
+      "avg_active=%.2f gate_up_fused=%.2f\n",
+      layer_idx, (unsigned long long)s.calls, (double)s.total_us * inv / 1000.0,
+      (double)s.setup_us * inv / 1000.0, (double)s.pack_us * inv / 1000.0,
+      (double)s.gate_up_us * inv / 1000.0, (double)s.activation_us * inv / 1000.0,
+      (double)s.down_pack_us * inv / 1000.0, (double)s.down_us * inv / 1000.0,
+      (double)s.merge_us * inv / 1000.0, (double)s.active_sum * inv, (double)s.gate_up_fused_sum * inv);
+}
+
+}  // namespace avx2_moe_detail
+
 template <class T, class Derived>
 class AVX2_MOE_BASE {
  public:
@@ -80,6 +161,17 @@ class AVX2_MOE_BASE {
   using input_t = ggml_bf16_t;
   using output_t = float;
   static constexpr double ELEMENT_SIZE = T::ELEMENT_SIZE;
+
+  // Backends that implement a single fused decode kernel (e.g. the SYCL iGPU backend)
+  // set this true and provide fused_decode(k, expert_ids, weights, input, output). The
+  // if constexpr guard in forward() compiles to nothing for all other backends.
+  static constexpr bool kFused = false;
+
+  // Opaque per-instance scratch for fused backends. MUST live in the base: TP_MOE_Common
+  // constructs AVX2_MOE_BASE<T,Derived> directly and CRTP-casts to Derived, so Derived may
+  // NOT add data members (they would be out of bounds). Fused backends stash a heap struct
+  // of device buffers here instead.
+  void* fused_scratch_ = nullptr;
 
   AVX2_MOE_BASE(GeneralMOEConfig config, int tp_part_idx_) : tp_part_idx(tp_part_idx_), config_(config) {
     init();
@@ -173,6 +265,13 @@ class AVX2_MOE_BASE {
   }
 
   void forward(int qlen, int k, const int64_t* expert_ids, const float* weights, const void* input, void* output) {
+    if constexpr (Derived::kFused) {
+      if (qlen == 1 && derived()->use_fused_decode()) {
+        derived()->fused_decode(k, expert_ids, weights, input, output);
+        return;
+      }
+      // qlen > 1 (prefill): fall through to the base per-GEMM path.
+    }
     if (qlen > 1) {
       forward_prefill(qlen, k, expert_ids, weights, input, output);
     } else {
@@ -189,6 +288,11 @@ class AVX2_MOE_BASE {
   void write_weights_to_buffer(Args&&... args) const {
     derived_const()->write_weights_to_buffer(std::forward<Args>(args)...);
   }
+
+  bool use_fused_gate_up_decode() const { return false; }
+  void decode_gate_up_activation(int, int) {}
+  bool use_fused_down_decode() const { return false; }
+  void decode_down_projection(int, int) {}
 
   void forward_prefill(int qlen, int k, const int64_t* expert_ids, const float* weights, const void* input,
                        void* output) {
@@ -351,6 +455,9 @@ class AVX2_MOE_BASE {
   void forward_decode(int k, const int64_t* expert_ids, const float* weights, const void* input, void* output) {
     int qlen = 1;
     auto pool = config_.pool->get_subpool(tp_part_idx);
+    const int decode_trace_every = avx2_moe_detail::decode_trace_every();
+    const bool trace_decode = decode_trace_every > 0;
+    const uint64_t t_decode_start = trace_decode ? avx2_moe_detail::now_us() : 0;
 
     int activated_expert = 0;
     std::fill(m_local_num_.begin(), m_local_num_.end(), 0);
@@ -378,20 +485,23 @@ class AVX2_MOE_BASE {
     void* down_bc_pool_ptr = down_bc_pool_;
     constexpr size_t M_STEP = T::M_STEP;
     auto align64 = [](size_t v) { return (v + 63) & (~(size_t)63); };
+    const bool gate_up_fused = activated_expert > 0 && derived()->use_fused_gate_up_decode();
 
     for (int i = 0; i < activated_expert; i++) {
       auto expert_idx = m_expert_id_map_[i];
       size_t max_m = (qlen + M_STEP - 1) / M_STEP * M_STEP;
 
-      gate_bc_[expert_idx]->max_m = max_m;
-      gate_bc_[expert_idx]->set_data(gate_bc_pool_ptr);
-      gate_bc_pool_ptr =
-          (void*)((uintptr_t)gate_bc_pool_ptr + align64(buffer_c_required_size(max_m, config_.intermediate_size)));
+      if (!gate_up_fused) {
+        gate_bc_[expert_idx]->max_m = max_m;
+        gate_bc_[expert_idx]->set_data(gate_bc_pool_ptr);
+        gate_bc_pool_ptr =
+            (void*)((uintptr_t)gate_bc_pool_ptr + align64(buffer_c_required_size(max_m, config_.intermediate_size)));
 
-      up_bc_[expert_idx]->max_m = max_m;
-      up_bc_[expert_idx]->set_data(up_bc_pool_ptr);
-      up_bc_pool_ptr =
-          (void*)((uintptr_t)up_bc_pool_ptr + align64(buffer_c_required_size(max_m, config_.intermediate_size)));
+        up_bc_[expert_idx]->max_m = max_m;
+        up_bc_[expert_idx]->set_data(up_bc_pool_ptr);
+        up_bc_pool_ptr =
+            (void*)((uintptr_t)up_bc_pool_ptr + align64(buffer_c_required_size(max_m, config_.intermediate_size)));
+      }
 
       down_ba_[expert_idx]->max_m = max_m;
       down_ba_[expert_idx]->set_data(down_ba_pool_ptr);
@@ -403,6 +513,7 @@ class AVX2_MOE_BASE {
       down_bc_pool_ptr =
           (void*)((uintptr_t)down_bc_pool_ptr + align64(buffer_c_required_size(max_m, config_.hidden_size)));
     }
+    const uint64_t t_after_setup = trace_decode ? avx2_moe_detail::now_us() : 0;
 
     // Pack input into BufferA for each activated expert
     void* gate_up_ba_pool_ptr = gate_up_ba_pool_;
@@ -415,48 +526,67 @@ class AVX2_MOE_BASE {
           (void*)((uintptr_t)gate_up_ba_pool_ptr + align64(buffer_a_required_size(max_m, config_.hidden_size)));
       gate_up_ba_[expert_idx]->from_mat(qlen, (ggml_bf16_t*)input, 0, 1);
     }
+    const uint64_t t_after_pack = trace_decode ? avx2_moe_detail::now_us() : t_after_setup;
 
     // Gate + Up GEMM
     int nth = T::recommended_nth(config_.intermediate_size);
-    pool->do_work_stealing_job(
-        nth * activated_expert * 2, [](int) { T::config(); },
-        [this, nth, qlen](int task_id2) {
-          int task_id = task_id2 / 2;
-          bool do_up = task_id2 % 2;
-          int expert_idx = m_expert_id_map_[task_id / nth];
-          int ith = task_id % nth;
-          derived()->do_gate_up_gemm(do_up, expert_idx, ith, nth, qlen);
-          if (do_up) {
-            up_bc_[expert_idx]->to_mat(qlen, m_local_up_output_ptr_[expert_idx], ith, nth);
-          } else {
-            gate_bc_[expert_idx]->to_mat(qlen, m_local_gate_output_ptr_[expert_idx], ith, nth);
-          }
-        },
-        nullptr);
+    uint64_t t_after_gate_up = t_after_pack;
+    uint64_t t_after_activation = t_after_pack;
+    uint64_t t_after_down_pack = t_after_pack;
+    if (gate_up_fused) {
+      derived()->decode_gate_up_activation(activated_expert, qlen);
+      t_after_gate_up = trace_decode ? avx2_moe_detail::now_us() : t_after_pack;
+      t_after_activation = t_after_gate_up;
+      t_after_down_pack = t_after_gate_up;
+    } else {
+      pool->do_work_stealing_job(
+          nth * activated_expert * 2, [](int) { T::config(); },
+          [this, nth, qlen](int task_id2) {
+            int task_id = task_id2 / 2;
+            bool do_up = task_id2 % 2;
+            int expert_idx = m_expert_id_map_[task_id / nth];
+            int ith = task_id % nth;
+            derived()->do_gate_up_gemm(do_up, expert_idx, ith, nth, qlen);
+            if (do_up) {
+              up_bc_[expert_idx]->to_mat(qlen, m_local_up_output_ptr_[expert_idx], ith, nth);
+            } else {
+              gate_bc_[expert_idx]->to_mat(qlen, m_local_gate_output_ptr_[expert_idx], ith, nth);
+            }
+          },
+          nullptr);
+      t_after_gate_up = trace_decode ? avx2_moe_detail::now_us() : t_after_pack;
 
-    // Activation
-    apply_activation(activated_expert, nth, qlen);
+      // Activation
+      apply_activation(activated_expert, nth, qlen);
+      t_after_activation = trace_decode ? avx2_moe_detail::now_us() : t_after_gate_up;
 
-    // Pack for down projection
-    pool->do_work_stealing_job(
-        activated_expert, nullptr,
-        [this, qlen](int task_id) {
-          int expert_idx = m_expert_id_map_[task_id];
-          down_ba_[expert_idx]->from_mat(qlen, m_local_gate_output_ptr_[expert_idx], 0, 1);
-        },
-        nullptr);
+      // Pack for down projection
+      pool->do_work_stealing_job(
+          activated_expert, nullptr,
+          [this, qlen](int task_id) {
+            int expert_idx = m_expert_id_map_[task_id];
+            down_ba_[expert_idx]->from_mat(qlen, m_local_gate_output_ptr_[expert_idx], 0, 1);
+          },
+          nullptr);
+      t_after_down_pack = trace_decode ? avx2_moe_detail::now_us() : t_after_activation;
+    }
 
     // Down GEMM
     nth = T::recommended_nth(config_.hidden_size);
-    pool->do_work_stealing_job(
-        nth * activated_expert, [](int) { T::config(); },
-        [this, nth, qlen](int task_id) {
-          int expert_idx = m_expert_id_map_[task_id / nth];
-          int ith = task_id % nth;
-          derived()->do_down_gemm(expert_idx, ith, nth, qlen);
-          down_bc_[expert_idx]->to_mat(qlen, m_local_down_output_ptr_[expert_idx], ith, nth);
-        },
-        nullptr);
+    if (activated_expert > 0 && derived()->use_fused_down_decode()) {
+      derived()->decode_down_projection(activated_expert, qlen);
+    } else {
+      pool->do_work_stealing_job(
+          nth * activated_expert, [](int) { T::config(); },
+          [this, nth, qlen](int task_id) {
+            int expert_idx = m_expert_id_map_[task_id / nth];
+            int ith = task_id % nth;
+            derived()->do_down_gemm(expert_idx, ith, nth, qlen);
+            down_bc_[expert_idx]->to_mat(qlen, m_local_down_output_ptr_[expert_idx], ith, nth);
+          },
+          nullptr);
+    }
+    const uint64_t t_after_down = trace_decode ? avx2_moe_detail::now_us() : t_after_down_pack;
 
     // Weighted sum — AVX2 (16 BF16 at a time)
     for (int e = 0; e < config_.hidden_size; e += 16) {
@@ -474,6 +604,14 @@ class AVX2_MOE_BASE {
       auto f32out = (__m256*)((float*)output + e);
       f32out[0] = x0;
       f32out[1] = x1;
+    }
+    if (trace_decode) {
+      const uint64_t t_decode_end = avx2_moe_detail::now_us();
+      avx2_moe_detail::trace_decode_timing(
+          config_.layer_idx, decode_trace_every, activated_expert, gate_up_fused, t_after_setup - t_decode_start,
+          t_after_pack - t_after_setup, t_after_gate_up - t_after_pack, t_after_activation - t_after_gate_up,
+          t_after_down_pack - t_after_activation, t_after_down - t_after_down_pack, t_decode_end - t_after_down,
+          t_decode_end - t_decode_start);
     }
   }
 

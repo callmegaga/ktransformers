@@ -23,6 +23,7 @@
   - [kt-cli](en/kt-kernel/kt-cli.md)
   - [AVX2 Backend Tutorial](en/kt-kernel/AVX2-Tutorial.md)
   - [AVX2 后端教程（中文）](zh/AVX2-Tutorial_zh.md)
+  - [SYCL GPTQ INT4 iGPU 调优记录（中文）](zh/SYCL_GPTQ_INT4_iGPU_tuning_zh.md)
 # FAQ
 - [FAQ](en/FAQ.md)
 <!-- # V3 Reproduction

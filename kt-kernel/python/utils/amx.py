@@ -19,8 +19,10 @@ from .loader import (
     MXFP4SafeTensorLoader,
     MXFP8SafeTensorLoader,
 )
-from kt_kernel_ext.moe import MOEConfig
-import kt_kernel_ext.moe as _moe_mod
+from kt_kernel import kt_kernel_ext
+
+_moe_mod = kt_kernel_ext.moe
+MOEConfig = _moe_mod.MOEConfig
 
 AMXInt4_MOE = getattr(_moe_mod, "AMXInt4_MOE", None)
 AMXInt8_MOE = getattr(_moe_mod, "AMXInt8_MOE", None)
@@ -39,6 +41,7 @@ AVX2MXFP4_MOE = getattr(_moe_mod, "AVX2MXFP4_MOE", None)
 AVX2MXFP8_MOE = getattr(_moe_mod, "AVX2MXFP8_MOE", None)
 AVXVNNI256GPTQInt4_MOE = getattr(_moe_mod, "AVXVNNI256GPTQInt4_MOE", None)
 AVXVNNI256RawInt4_MOE = getattr(_moe_mod, "AVXVNNI256RawInt4_MOE", None)
+SYCLGPTQInt4_MOE = getattr(_moe_mod, "SYCLGPTQInt4_MOE", None)
 
 _HAS_AMXINT4_SUPPORT = AMXInt4_MOE is not None
 _HAS_AMXINT8_SUPPORT = AMXInt8_MOE is not None
@@ -57,6 +60,7 @@ _HAS_AVX2_MXFP4_SUPPORT = AVX2MXFP4_MOE is not None
 _HAS_AVX2_MXFP8_SUPPORT = AVX2MXFP8_MOE is not None
 _HAS_AVXVNNI256_GPTQ_INT4_SUPPORT = AVXVNNI256GPTQInt4_MOE is not None
 _HAS_AVXVNNI256_RAW_INT4_SUPPORT = AVXVNNI256RawInt4_MOE is not None
+_HAS_SYCL_GPTQ_INT4_SUPPORT = SYCLGPTQInt4_MOE is not None
 _AVXVNNI256_GPTQ_INT4_MAX_GROUP_SIZE = 256
 _AVXVNNI256_RAW_INT4_MAX_GROUP_SIZE = 256
 
@@ -667,7 +671,7 @@ class NativeMoEWrapper(BaseMoEWrapper):
             return FP8SafeTensorLoader(weight_path, scale_suffix="weight_scale")
         elif method == "BF16":
             return BF16SafeTensorLoader(weight_path)
-        elif method == "GPTQ_INT4":
+        elif method in ("GPTQ_INT4", "SYCL_GPTQ_INT4"):
             return GPTQSafeTensorLoader(weight_path)
         elif method == "MXFP4":
             return MXFP4SafeTensorLoader(weight_path)
@@ -911,6 +915,21 @@ class NativeMoEWrapper(BaseMoEWrapper):
                     f"{_AVXVNNI256_GPTQ_INT4_MAX_GROUP_SIZE}; AVX2 is used as the fallback when available."
                 )
             self.moe = backend_cls(moe_config)
+        elif self.method == "SYCL_GPTQ_INT4":
+            # GPTQ symmetric INT4 experts on a SYCL device (Intel iGPU). Same weight/scale
+            # layout as GPTQ_INT4; only the backend class differs.
+            group_size = self.gate_scales[0].shape[0]  # scales shape [K/gs, N], first dim = num_groups
+            actual_gs = self.hidden_size // group_size
+            moe_config.quant_config.bits = 4
+            moe_config.quant_config.group_size = actual_gs
+            moe_config.quant_config.zero_point = False
+            if not _HAS_SYCL_GPTQ_INT4_SUPPORT:
+                raise RuntimeError(
+                    "SYCL_GPTQ_INT4 backend not available. Rebuild kt_kernel_ext with "
+                    "CPUINFER_USE_SYCL=1 using a SYCL compiler (icpx)."
+                )
+            _preflight_sycl_fp8_device()  # same iGPU/render-node permission preflight
+            self.moe = SYCLGPTQInt4_MOE(moe_config)
         elif self.method == "BF16":
             # BF16 has no quantization config needed
             # Prefer AMX backend, fall back to AVX2

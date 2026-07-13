@@ -67,6 +67,7 @@ static const bool _is_plain_ = false;
 #endif
 #if defined(USE_SYCL)
 #include "operators/sycl/fp8-moe.hpp"
+#include "operators/sycl/gptq_int4_sycl-moe.hpp"
 #endif
 
 #include <pybind11/stl.h>  // std::vector/std::pair/std::string conversions
@@ -838,6 +839,7 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
 #endif
 #if defined(USE_SYCL)
   bind_moe_module<SYCL_FP8_MOE_TP<sycl_fp8::GemmKernelSYCLFP8>>(moe_module, "SYCLFP8_MOE");
+  bind_moe_module<SYCL_GPTQ_INT4_MOE_TP<sycl_int4::GemmKernelSYCLGPTQInt4>>(moe_module, "SYCLGPTQInt4_MOE");
 #endif
 
 #if defined(USE_MOE_KERNEL)
