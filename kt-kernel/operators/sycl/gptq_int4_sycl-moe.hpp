@@ -446,6 +446,54 @@ static inline sycl::event gemm_gptq_int4_sycl_subgroup_submit(int m, int n, int 
 }
 
 template <int SG>
+static inline sycl::event gemm_gptq_int4_sycl_subgroup_packed_submit(
+    int m, int n, int k, GemmKernelSYCLGPTQInt4::BufferA& a, GemmKernelSYCLGPTQInt4::BufferB& b,
+    GemmKernelSYCLGPTQInt4::BufferC& c, int ith, int nth, const sycl::event* dependency = nullptr) {
+  if (m <= 0 || n <= 0 || k <= 0) return sycl::event{};
+  auto [ns, ne] = avx2::split_range(n, ith, nth);
+  if (ns >= ne) return sycl::event{};
+  auto& q = queue();
+  const int N = b.n, gs = b.group_size, numg = b.num_groups;
+  const int packed_per_group = gs / 8;
+  uint16_t* a_data = a.data;
+  uint32_t* qw = b.qw;
+  float* sc = b.scales;
+  float* c_data = c.data;
+  const size_t a_ld = a.k, c_ld = c.n;
+  const int nlen = ne - ns;
+  const size_t groups = (size_t)m * (size_t)nlen;
+  return q.submit([&](sycl::handler& h) {
+    if (dependency != nullptr) h.depends_on(*dependency);
+    h.parallel_for(sycl::nd_range<1>(groups * (size_t)SG, (size_t)SG), [=](sycl::nd_item<1> it)
+                   [[sycl::reqd_sub_group_size(SG)]] {
+      const int gid = (int)it.get_group(0);
+      const int lane = (int)it.get_local_id(0);
+      const int mi = gid / nlen;
+      const int ni = ns + (gid - mi * nlen);
+      const uint16_t* arow = a_data + (size_t)mi * a_ld;
+      float acc = 0.f;
+      for (int g = 0; g < numg; ++g) {
+        float partial = 0.f;
+        const int kp_base = g * packed_per_group;
+        for (int kpi = lane; kpi < packed_per_group; kpi += SG) {
+          const int kp = kp_base + kpi;
+          const uint32_t packed = qw[(size_t)kp * N + ni];
+          const uint16_t* xb = arow + (size_t)kp * 8;
+#pragma unroll
+          for (int bb = 0; bb < 8; ++bb) {
+            const int w = (int)((packed >> (bb * 4)) & 0xFu) - 8;
+            partial += bf16_to_fp32(xb[bb]) * (float)w;
+          }
+        }
+        const float group_sum = sycl::reduce_over_group(it.get_sub_group(), partial, sycl::plus<float>());
+        if (lane == 0) acc += group_sum * sc[(size_t)g * N + ni];
+      }
+      if (lane == 0) c_data[(size_t)mi * c_ld + ni] = acc;
+    });
+  });
+}
+
+template <int SG>
 static inline void gemm_gptq_int4_sycl_subgroup(int m, int n, int k, GemmKernelSYCLGPTQInt4::BufferA& a,
                                                 GemmKernelSYCLGPTQInt4::BufferB& b,
                                                 GemmKernelSYCLGPTQInt4::BufferC& c, int ith, int nth) {
@@ -487,7 +535,21 @@ static inline sycl::event gemm_gptq_int4_sycl_subgroup_submit_dispatch(
   }
 }
 
-template <int SG>
+static inline sycl::event gemm_gptq_int4_sycl_subgroup_packed_submit_dispatch(
+    int sg, int m, int n, int k, GemmKernelSYCLGPTQInt4::BufferA& a, GemmKernelSYCLGPTQInt4::BufferB& b,
+    GemmKernelSYCLGPTQInt4::BufferC& c, int ith, int nth, const sycl::event* dependency = nullptr) {
+  switch (sg) {
+    case 8:
+      return gemm_gptq_int4_sycl_subgroup_packed_submit<8>(m, n, k, a, b, c, ith, nth, dependency);
+    case 32:
+      return gemm_gptq_int4_sycl_subgroup_packed_submit<32>(m, n, k, a, b, c, ith, nth, dependency);
+    case 16:
+    default:
+      return gemm_gptq_int4_sycl_subgroup_packed_submit<16>(m, n, k, a, b, c, ith, nth, dependency);
+  }
+}
+
+template <int SG, bool PackedBlock = false>
 static inline sycl::event gate_up_activation_gptq_int4_sycl_subgroup_submit(
     int m, int n, int k, GemmKernelSYCLGPTQInt4::BufferA& a, GemmKernelSYCLGPTQInt4::BufferB& gate_b,
     GemmKernelSYCLGPTQInt4::BufferB& up_b, GemmKernelSYCLGPTQInt4::BufferA& out_ba, float swiglu_limit,
@@ -499,6 +561,7 @@ static inline sycl::event gate_up_activation_gptq_int4_sycl_subgroup_submit(
   }
   auto& q = queue();
   const int N = gate_b.n, gs = gate_b.group_size, numg = gate_b.num_groups;
+  const int packed_per_group = gs / 8;
   uint16_t* a_data = a.data;
   uint32_t* gqw = gate_b.qw;
   uint32_t* uqw = up_b.qw;
@@ -521,15 +584,31 @@ static inline sycl::event gate_up_activation_gptq_int4_sycl_subgroup_submit(
        for (int g = 0; g < numg; ++g) {
          float gate_partial = 0.f;
          float up_partial = 0.f;
-         const int kbase = g * gs;
-         for (int t = lane; t < gs; t += SG) {
-           const int kk = kbase + t;
-           const int shift = (kk & 7) * 4;
-           const float xv = bf16_to_fp32(arow[kk]);
-           const uint32_t pg = gqw[(size_t)(kk >> 3) * N + ni];
-           const uint32_t pu = uqw[(size_t)(kk >> 3) * N + ni];
-           gate_partial += xv * (float)((int)((pg >> shift) & 0xFu) - 8);
-           up_partial += xv * (float)((int)((pu >> shift) & 0xFu) - 8);
+         if constexpr (PackedBlock) {
+           const int kp_base = g * packed_per_group;
+           for (int kpi = lane; kpi < packed_per_group; kpi += SG) {
+             const int kp = kp_base + kpi;
+             const uint32_t pg = gqw[(size_t)kp * N + ni];
+             const uint32_t pu = uqw[(size_t)kp * N + ni];
+             const uint16_t* xb = arow + (size_t)kp * 8;
+#pragma unroll
+             for (int bb = 0; bb < 8; ++bb) {
+               const float xv = bf16_to_fp32(xb[bb]);
+               gate_partial += xv * (float)((int)((pg >> (bb * 4)) & 0xFu) - 8);
+               up_partial += xv * (float)((int)((pu >> (bb * 4)) & 0xFu) - 8);
+             }
+           }
+         } else {
+           const int kbase = g * gs;
+           for (int t = lane; t < gs; t += SG) {
+             const int kk = kbase + t;
+             const int shift = (kk & 7) * 4;
+             const float xv = bf16_to_fp32(arow[kk]);
+             const uint32_t pg = gqw[(size_t)(kk >> 3) * N + ni];
+             const uint32_t pu = uqw[(size_t)(kk >> 3) * N + ni];
+             gate_partial += xv * (float)((int)((pg >> shift) & 0xFu) - 8);
+             up_partial += xv * (float)((int)((pu >> shift) & 0xFu) - 8);
+           }
          }
          const float gate_sum = sycl::reduce_over_group(it.get_sub_group(), gate_partial, sycl::plus<float>());
          const float up_sum = sycl::reduce_over_group(it.get_sub_group(), up_partial, sycl::plus<float>());
@@ -611,6 +690,24 @@ static inline sycl::event gate_up_activation_gptq_int4_sycl_subgroup_submit_disp
     default:
       return gate_up_activation_gptq_int4_sycl_subgroup_submit<16>(m, n, k, a, gate_b, up_b, out_ba, swiglu_limit,
                                                                    swiglu_alpha, fast_silu);
+  }
+}
+
+static inline sycl::event gate_up_activation_gptq_int4_sycl_subgroup_packed_submit_dispatch(
+    int sg, int m, int n, int k, GemmKernelSYCLGPTQInt4::BufferA& a, GemmKernelSYCLGPTQInt4::BufferB& gate_b,
+    GemmKernelSYCLGPTQInt4::BufferB& up_b, GemmKernelSYCLGPTQInt4::BufferA& out_ba, float swiglu_limit,
+    float swiglu_alpha, bool fast_silu) {
+  switch (sg) {
+    case 8:
+      return gate_up_activation_gptq_int4_sycl_subgroup_submit<8, true>(
+          m, n, k, a, gate_b, up_b, out_ba, swiglu_limit, swiglu_alpha, fast_silu);
+    case 32:
+      return gate_up_activation_gptq_int4_sycl_subgroup_submit<32, true>(
+          m, n, k, a, gate_b, up_b, out_ba, swiglu_limit, swiglu_alpha, fast_silu);
+    case 16:
+    default:
+      return gate_up_activation_gptq_int4_sycl_subgroup_submit<16, true>(
+          m, n, k, a, gate_b, up_b, out_ba, swiglu_limit, swiglu_alpha, fast_silu);
   }
 }
 
@@ -928,7 +1025,7 @@ inline DownAsyncTraceState& down_async_trace_state(int layer_idx) {
 }
 
 inline void trace_down_async_timing(int layer_idx, int active, int n, int k, int sg, uint64_t elapsed_us,
-                                    bool pipeline = false) {
+                                    bool pipeline = false, const char* kernel = "subgroup") {
   const int trace_every = env_int("KT_SYCL_INT4_TRACE_EVERY", 0);
   if (trace_every <= 0) return;
   auto& state = down_async_trace_state(layer_idx);
@@ -940,9 +1037,9 @@ inline void trace_down_async_timing(int layer_idx, int active, int n, int k, int
   const double avg_active = (double)state.active_sum * inv;
   const double avg_total_ms = (double)state.total_us * inv / 1000.0;
   std::printf(
-      "[SYCL_GPTQ_INT4 down_async] kernel=subgroup layer=%d calls=%llu avg_total=%.3fms "
+      "[SYCL_GPTQ_INT4 down_async] kernel=%s layer=%d calls=%llu avg_total=%.3fms "
       "avg_per_active=%.3fms avg_active=%.2f n=%d k=%d sg=%d pipeline=%d\n",
-      layer_idx, (unsigned long long)state.calls, avg_total_ms,
+      kernel, layer_idx, (unsigned long long)state.calls, avg_total_ms,
       avg_active > 0.0 ? avg_total_ms / avg_active : 0.0, avg_active, n, k, sg, pipeline ? 1 : 0);
 }
 
@@ -1060,6 +1157,9 @@ class SYCL_GPTQ_INT4_MOE_TP : public AVX2_MOE_BASE<T, SYCL_GPTQ_INT4_MOE_TP<T>> 
     if (qlen != 1 || activated_expert <= 0) return;
     T::config();
     const int subgroup_size = sycl_int4::env_int("KT_SYCL_INT4_PER_GEMM_SUBGROUP", 32);
+    const bool use_packed = sycl_int4::env_flag("KT_SYCL_INT4_DOWN_PACKED", true);
+    const int down_subgroup_size =
+        use_packed ? sycl_int4::env_int("KT_SYCL_INT4_DOWN_PACKED_SUBGROUP", 16) : subgroup_size;
     const bool trace = sycl_int4::env_int("KT_SYCL_INT4_TRACE_EVERY", 0) > 0;
     auto* s = reinterpret_cast<sycl_int4::FusedScratch*>(fused_scratch_);
     const bool use_pipeline = sycl_int4::env_flag("KT_SYCL_INT4_GATE_UP_DOWN_PIPELINE", false);
@@ -1080,9 +1180,15 @@ class SYCL_GPTQ_INT4_MOE_TP : public AVX2_MOE_BASE<T, SYCL_GPTQ_INT4_MOE_TP<T>> 
           has_pipeline && s->gate_up_pipeline_experts[(size_t)task_id] == expert_idx
               ? &s->gate_up_pipeline_events[(size_t)task_id]
               : nullptr;
-      events.push_back(sycl_int4::gemm_gptq_int4_sycl_subgroup_submit_dispatch(
-          subgroup_size, m, config_.hidden_size, config_.intermediate_size, *down_ba_[expert_idx],
-          *down_bb_[expert_idx], *down_bc_[expert_idx], 0, 1, dependency));
+      if (use_packed) {
+        events.push_back(sycl_int4::gemm_gptq_int4_sycl_subgroup_packed_submit_dispatch(
+            down_subgroup_size, m, config_.hidden_size, config_.intermediate_size, *down_ba_[expert_idx],
+            *down_bb_[expert_idx], *down_bc_[expert_idx], 0, 1, dependency));
+      } else {
+        events.push_back(sycl_int4::gemm_gptq_int4_sycl_subgroup_submit_dispatch(
+            down_subgroup_size, m, config_.hidden_size, config_.intermediate_size, *down_ba_[expert_idx],
+            *down_bb_[expert_idx], *down_bc_[expert_idx], 0, 1, dependency));
+      }
     }
     for (auto& ev : events) ev.wait_and_throw();
     if (s != nullptr) {
@@ -1095,8 +1201,9 @@ class SYCL_GPTQ_INT4_MOE_TP : public AVX2_MOE_BASE<T, SYCL_GPTQ_INT4_MOE_TP<T>> 
     }
     if (trace) {
       sycl_int4::trace_down_async_timing(config_.layer_idx, activated_expert, config_.hidden_size,
-                                         config_.intermediate_size, subgroup_size, sycl_int4::now_us() - t0,
-                                         has_pipeline);
+                                         config_.intermediate_size, down_subgroup_size,
+                                         sycl_int4::now_us() - t0, has_pipeline,
+                                         use_packed ? "subgroup_packed" : "subgroup");
     }
   }
 
@@ -1116,6 +1223,10 @@ class SYCL_GPTQ_INT4_MOE_TP : public AVX2_MOE_BASE<T, SYCL_GPTQ_INT4_MOE_TP<T>> 
     const bool trace = sycl_int4::env_int("KT_SYCL_INT4_TRACE_EVERY", 0) > 0;
     const bool fast_silu = sycl_int4::fast_silu_enabled();
     const bool use_q8_gate_up = sycl_int4::env_flag("KT_SYCL_INT4_GATE_UP_Q8", false);
+    const bool use_packed_gate_up =
+        !use_q8_gate_up && sycl_int4::env_flag("KT_SYCL_INT4_GATE_UP_PACKED", true);
+    const int packed_gate_up_subgroup_size =
+        use_packed_gate_up ? sycl_int4::env_int("KT_SYCL_INT4_GATE_UP_PACKED_SUBGROUP", 16) : subgroup_size;
     const int gate_up_subgroup_size =
         use_q8_gate_up ? sycl_int4::env_int("KT_SYCL_INT4_GATE_UP_Q8_SUBGROUP", subgroup_size) : subgroup_size;
     const bool use_batch = sycl_int4::env_flag("KT_SYCL_INT4_GATE_UP_BATCH", false) ||
@@ -1214,6 +1325,11 @@ class SYCL_GPTQ_INT4_MOE_TP : public AVX2_MOE_BASE<T, SYCL_GPTQ_INT4_MOE_TP<T>> 
               gate_up_subgroup_size, m, config_.intermediate_size, config_.hidden_size, q8_scratch->xq,
               q8_scratch->xs, *gate_bb_[expert_idx], *up_bb_[expert_idx], *down_ba_[expert_idx],
               config_.swiglu_limit, config_.swiglu_alpha, fast_silu));
+        } else if (use_packed_gate_up) {
+          events->push_back(sycl_int4::gate_up_activation_gptq_int4_sycl_subgroup_packed_submit_dispatch(
+              packed_gate_up_subgroup_size, m, config_.intermediate_size, config_.hidden_size,
+              *gate_up_ba_[expert_idx], *gate_bb_[expert_idx], *up_bb_[expert_idx], *down_ba_[expert_idx],
+              config_.swiglu_limit, config_.swiglu_alpha, fast_silu));
         } else {
           events->push_back(sycl_int4::gate_up_activation_gptq_int4_sycl_subgroup_submit_dispatch(
               subgroup_size, m, config_.intermediate_size, config_.hidden_size, *gate_up_ba_[expert_idx],
@@ -1227,10 +1343,13 @@ class SYCL_GPTQ_INT4_MOE_TP : public AVX2_MOE_BASE<T, SYCL_GPTQ_INT4_MOE_TP<T>> 
         if (trace) {
           sycl_int4::trace_gate_up_pipeline_submit_timing(config_.layer_idx, activated_expert,
                                                           config_.intermediate_size, config_.hidden_size,
-                                                          use_q8_gate_up ? gate_up_subgroup_size : subgroup_size,
+                                                          use_q8_gate_up ? gate_up_subgroup_size
+                                                                         : packed_gate_up_subgroup_size,
                                                           sycl_int4::now_us() - t0,
-                                                          use_q8_gate_up ? "subgroup_fused_q8"
-                                                                         : "subgroup_fused");
+                                                          use_q8_gate_up
+                                                              ? "subgroup_fused_q8"
+                                                              : (use_packed_gate_up ? "subgroup_fused_packed"
+                                                                                    : "subgroup_fused"));
         }
         return;
       }
@@ -1238,9 +1357,12 @@ class SYCL_GPTQ_INT4_MOE_TP : public AVX2_MOE_BASE<T, SYCL_GPTQ_INT4_MOE_TP<T>> 
       if (trace) {
         sycl_int4::trace_gate_up_async_timing(config_.layer_idx, activated_expert, config_.intermediate_size,
                                               config_.hidden_size,
-                                              use_q8_gate_up ? gate_up_subgroup_size : subgroup_size,
+                                              use_q8_gate_up ? gate_up_subgroup_size : packed_gate_up_subgroup_size,
                                               sycl_int4::now_us() - t0,
-                                              use_q8_gate_up ? "subgroup_fused_q8" : "subgroup_fused");
+                                              use_q8_gate_up
+                                                  ? "subgroup_fused_q8"
+                                                  : (use_packed_gate_up ? "subgroup_fused_packed"
+                                                                        : "subgroup_fused"));
       }
       return;
     }
@@ -1256,6 +1378,12 @@ class SYCL_GPTQ_INT4_MOE_TP : public AVX2_MOE_BASE<T, SYCL_GPTQ_INT4_MOE_TP<T>> 
             q8_scratch->xs, *gate_bb_[expert_idx], *up_bb_[expert_idx], *down_ba_[expert_idx],
             config_.swiglu_limit, config_.swiglu_alpha, fast_silu)
             .wait_and_throw();
+      } else if (use_packed_gate_up) {
+        sycl_int4::gate_up_activation_gptq_int4_sycl_subgroup_packed_submit_dispatch(
+            packed_gate_up_subgroup_size, m, config_.intermediate_size, config_.hidden_size,
+            *gate_up_ba_[expert_idx], *gate_bb_[expert_idx], *up_bb_[expert_idx], *down_ba_[expert_idx],
+            config_.swiglu_limit, config_.swiglu_alpha, fast_silu)
+            .wait_and_throw();
       } else {
         sycl_int4::gate_up_activation_gptq_int4_sycl_subgroup_dispatch(
             subgroup_size, m, config_.intermediate_size, config_.hidden_size, *gate_up_ba_[expert_idx],
@@ -1266,7 +1394,9 @@ class SYCL_GPTQ_INT4_MOE_TP : public AVX2_MOE_BASE<T, SYCL_GPTQ_INT4_MOE_TP<T>> 
         sycl_int4::trace_per_gemm_timing("gate_up_act", 3, config_.layer_idx, expert_idx, m,
                                          config_.intermediate_size, config_.hidden_size,
                                          sycl_int4::now_us() - t0,
-                                         use_q8_gate_up ? "subgroup_fused_q8" : "subgroup_fused");
+                                         use_q8_gate_up
+                                             ? "subgroup_fused_q8"
+                                             : (use_packed_gate_up ? "subgroup_fused_packed" : "subgroup_fused"));
       }
     }
   }

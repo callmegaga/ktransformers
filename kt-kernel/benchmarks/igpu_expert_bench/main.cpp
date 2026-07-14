@@ -16,6 +16,7 @@
 // (decode) and MAC volume (prefill); keeps CPU/iGPU correctness compare exact.
 
 #include <sycl/sycl.hpp>
+#include <sycl/ext/oneapi/dot_product.hpp>
 
 #include <immintrin.h>
 #include <omp.h>
@@ -140,7 +141,17 @@ static void cpu_gemm(const Batch& b, int j0, int j1) {
   }
 }
 
-// ---- iGPU SYCL decode (M==1): reads int4, load-once + unpack-8 ----
+static inline int32_t unpack_i4x4_to_i8x4(uint32_t packed) {
+  uint32_t x = packed & 0xffffu;
+  x = (x | (x << 8)) & 0x00ff00ffu;
+  x = (x | (x << 4)) & 0x0f0f0f0fu;
+  const uint32_t neg = (~x) & 0x08080808u;
+  x = (x & 0x07070707u) | neg | (neg << 1) | (neg << 2) | (neg << 3) | (neg << 4);
+  return sycl::bit_cast<int32_t>(x);
+}
+
+// ---- iGPU SYCL decode (M==1): scalar baseline or packed signed DP4A ----
+template <bool PackedDot>
 static event gpu_decode(queue& q, const Batch& b, int j0, int j1, const std::vector<event>& deps = {}) {
   const int N = b.N, K = b.K, numg = b.numg, Kp = b.K / 8;
   uint32_t* w4 = b.w4; int8_t* aq = b.aq; float* wsc = b.wscale; float* asc = b.ascale; float* out = b.out_gpu;
@@ -160,13 +171,114 @@ static event gpu_decode(queue& q, const Batch& b, int j0, int j1, const std::vec
         for (int kp = kp0; kp < kp0 + ppg; ++kp) {
           uint32_t packed = w[(size_t)kp * N + n];
           const int8_t* a8 = a + (size_t)kp * 8;
+          if constexpr (PackedDot) {
+            const int32_t a0 = *reinterpret_cast<const int32_t*>(a8);
+            const int32_t a1 = *reinterpret_cast<const int32_t*>(a8 + 4);
+            dot = ext::oneapi::dot_acc(a0, unpack_i4x4_to_i8x4(packed), dot);
+            dot = ext::oneapi::dot_acc(a1, unpack_i4x4_to_i8x4(packed >> 16), dot);
+          } else {
 #pragma unroll
-          for (int bb = 0; bb < 8; ++bb) dot += (int)a8[bb] * ((int)((packed >> (bb * 4)) & 0xF) - 8);
+            for (int bb = 0; bb < 8; ++bb)
+              dot += (int)a8[bb] * ((int)((packed >> (bb * 4)) & 0xF) - 8);
+          }
         }
         oacc += (float)dot * as[g] * ws[(size_t)g * N + n];
       }
       out[(size_t)j * N + n] = oacc;
     });
+  });
+}
+
+template <int SG, bool PackedBlock>
+static event gpu_decode_subgroup(queue& q, const Batch& b, int j0, int j1) {
+  const int N = b.N, K = b.K, numg = b.numg, Kp = b.K / 8;
+  uint32_t* w4 = b.w4;
+  int8_t* aq = b.aq;
+  float* wsc = b.wscale;
+  float* asc = b.ascale;
+  float* out = b.out_gpu;
+  const int nj = j1 - j0;
+  const size_t groups = (size_t)nj * N;
+  return q.parallel_for(nd_range<1>(groups * SG, SG), [=](nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+    const int gid = (int)it.get_group(0);
+    const int lane = (int)it.get_local_id(0);
+    const int j = j0 + gid / N, n = gid % N;
+    const uint32_t* w = w4 + (size_t)j * Kp * N;
+    const int8_t* a = aq + (size_t)j * K;
+    const float* as = asc + (size_t)j * numg;
+    const float* ws = wsc + (size_t)j * numg * N;
+    float oacc = 0.f;
+    for (int g = 0; g < numg; ++g) {
+      int partial = 0;
+      if constexpr (PackedBlock) {
+        const int kp0 = g * (GS / 8);
+        for (int kpi = lane; kpi < GS / 8; kpi += SG) {
+          const int kp = kp0 + kpi;
+          const uint32_t packed = w[(size_t)kp * N + n];
+          const int8_t* a8 = a + (size_t)kp * 8;
+#pragma unroll
+          for (int bb = 0; bb < 8; ++bb)
+            partial += (int)a8[bb] * ((int)((packed >> (bb * 4)) & 0xF) - 8);
+        }
+      } else {
+        const int k0 = g * GS;
+        for (int t = lane; t < GS; t += SG) {
+          const int kk = k0 + t;
+          const uint32_t packed = w[(size_t)(kk / 8) * N + n];
+          partial += (int)a[kk] * ((int)((packed >> ((kk % 8) * 4)) & 0xF) - 8);
+        }
+      }
+      const int sum = reduce_over_group(it.get_sub_group(), partial, plus<int>());
+      if (lane == 0) oacc += (float)sum * as[g] * ws[(size_t)g * N + n];
+    }
+    if (lane == 0) out[(size_t)j * N + n] = oacc;
+  });
+}
+
+template <int SG, int LanesPerOutput = 1>
+static event gpu_decode_output_lanes(queue& q, const Batch& b, int j0, int j1) {
+  static_assert(LanesPerOutput > 0 && LanesPerOutput <= SG && (SG % LanesPerOutput) == 0);
+  const int N = b.N, K = b.K, numg = b.numg, Kp = b.K / 8;
+  uint32_t* w4 = b.w4;
+  int8_t* aq = b.aq;
+  float* wsc = b.wscale;
+  float* asc = b.ascale;
+  float* out = b.out_gpu;
+  const int nj = j1 - j0;
+  constexpr int OutputsPerGroup = SG / LanesPerOutput;
+  const int nblocks = (N + OutputsPerGroup - 1) / OutputsPerGroup;
+  const size_t groups = (size_t)nj * nblocks;
+  return q.parallel_for(nd_range<1>(groups * SG, SG), [=](nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+    const int gid = (int)it.get_group(0);
+    const int lane = (int)it.get_local_id(0);
+    const int output_lane = lane / LanesPerOutput;
+    const int k_lane = lane - output_lane * LanesPerOutput;
+    const int j = j0 + gid / nblocks;
+    const int n = (gid % nblocks) * OutputsPerGroup + output_lane;
+    const bool valid = n < N;
+    const uint32_t* w = w4 + (size_t)j * Kp * N;
+    const int8_t* a = aq + (size_t)j * K;
+    const float* as = asc + (size_t)j * numg;
+    const float* ws = wsc + (size_t)j * numg * N;
+    float oacc = 0.f;
+    for (int g = 0; g < numg; ++g) {
+      int dot[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+      const int kp0 = g * (GS / 8);
+      for (int kpi = k_lane; kpi < GS / 8; kpi += LanesPerOutput) {
+        const int kp = kp0 + kpi;
+        const uint32_t packed = valid ? w[(size_t)kp * N + n] : 0;
+        const int8_t* a8 = a + (size_t)kp * 8;
+#pragma unroll
+        for (int bb = 0; bb < 8; ++bb)
+          if (valid) dot[bb] += (int)a8[bb] * ((int)((packed >> (bb * 4)) & 0xF) - 8);
+      }
+      int group_sum = ((dot[0] + dot[1]) + (dot[2] + dot[3])) +
+                      ((dot[4] + dot[5]) + (dot[6] + dot[7]));
+      for (int mask = LanesPerOutput / 2; mask > 0; mask >>= 1)
+        group_sum += select_from_group(it.get_sub_group(), group_sum, lane ^ mask);
+      if (valid && k_lane == 0) oacc += (float)group_sum * as[g] * ws[(size_t)g * N + n];
+    }
+    if (valid && k_lane == 0) out[(size_t)j * N + n] = oacc;
   });
 }
 
@@ -254,10 +366,51 @@ int main(int argc, char** argv) {
   double gflop = 2.0 * macs / 1e9;
 
   auto run_cpu = [&] { for (auto* b : B) cpu_gemm(*b, 0, b->njobs); };
-  auto run_gpu = [&] {
-    if (M == 1) for (auto* b : B) gpu_decode(q, *b, 0, b->njobs);
+  auto run_gpu_scalar = [&] {
+    if (M == 1) for (auto* b : B) gpu_decode<false>(q, *b, 0, b->njobs);
     else for (auto* b : B) gpu_prefill(q, *b);
     q.wait();
+  };
+  auto run_gpu_dot = [&] {
+    if (M == 1) for (auto* b : B) gpu_decode<true>(q, *b, 0, b->njobs);
+    else for (auto* b : B) gpu_prefill(q, *b);
+    q.wait();
+  };
+  auto run_gpu_sg_nibble = [&] {
+    if (M == 1) for (auto* b : B) gpu_decode_subgroup<32, false>(q, *b, 0, b->njobs);
+    else for (auto* b : B) gpu_prefill(q, *b);
+    q.wait();
+  };
+  auto run_gpu_sg_packed = [&] {
+    if (M == 1) for (auto* b : B) gpu_decode_subgroup<16, true>(q, *b, 0, b->njobs);
+    else for (auto* b : B) gpu_prefill(q, *b);
+    q.wait();
+  };
+  auto run_gpu_sg_packed8 = [&] {
+    if (M == 1) for (auto* b : B) gpu_decode_subgroup<8, true>(q, *b, 0, b->njobs);
+    else for (auto* b : B) gpu_prefill(q, *b);
+    q.wait();
+  };
+  auto run_down_sg_packed = [&] {
+    gpu_decode_subgroup<16, true>(q, down, 0, down.njobs).wait();
+  };
+  auto run_down_output8 = [&] {
+    gpu_decode_output_lanes<8>(q, down, 0, down.njobs).wait();
+  };
+  auto run_down_output16 = [&] {
+    gpu_decode_output_lanes<16>(q, down, 0, down.njobs).wait();
+  };
+  auto run_down_output32 = [&] {
+    gpu_decode_output_lanes<32>(q, down, 0, down.njobs).wait();
+  };
+  auto run_down_tile4 = [&] {
+    gpu_decode_output_lanes<32, 16>(q, down, 0, down.njobs).wait();
+  };
+  auto run_down_tile8 = [&] {
+    gpu_decode_output_lanes<32, 8>(q, down, 0, down.njobs).wait();
+  };
+  auto run_down_tile16 = [&] {
+    gpu_decode_output_lanes<32, 4>(q, down, 0, down.njobs).wait();
   };
 
   // ---- power mode: sustained ~12s load for external turbostat ----
@@ -265,7 +418,7 @@ int main(int argc, char** argv) {
     printf("[power] sustained %s load ~12s (wrap with: sudo turbostat --Summary "
            "--show PkgWatt,GFXWatt,GFXMHz,Busy%% -- <this cmd>)\n", mode.c_str());
     double t0 = now_ms(); long reps = 0;
-    while (now_ms() - t0 < 12000.0) { if (mode == "cpu") run_cpu(); else run_gpu(); reps++; }
+    while (now_ms() - t0 < 12000.0) { if (mode == "cpu") run_cpu(); else run_gpu_dot(); reps++; }
     double el = now_ms() - t0;
     printf("[power] %s reps=%ld  tok/s=%.1f  (tokens=%d/rep)\n", mode.c_str(), reps, reps * M * 1000.0 / el, M);
     for (auto* b : B) free_batch(q, *b);
@@ -301,7 +454,8 @@ int main(int argc, char** argv) {
   // ---- correctness (down) ----
   {
     cpu_gemm(down, 0, down.njobs);
-    if (M == 1) gpu_decode(q, down, 0, down.njobs).wait(); else gpu_prefill(q, down).wait();
+    if (M == 1) gpu_decode<false>(q, down, 0, down.njobs).wait(); else gpu_prefill(q, down).wait();
+    std::vector<float> scalar_out(down.out_gpu, down.out_gpu + (size_t)down.njobs * M * down.N);
     double maxrel = 0; long bad = 0, tot = (long)down.njobs * M * down.N, first = -1;
     for (long i = 0; i < tot; ++i) {
       double a = down.out_cpu[i], g = down.out_gpu[i];
@@ -315,16 +469,105 @@ int main(int argc, char** argv) {
              down.out_cpu[first], down.out_gpu[first]);
     }
     printf("\n");
+
+    if (M == 1) {
+      gpu_decode<true>(q, down, 0, down.njobs).wait();
+      double dot_maxrel = 0; long dot_bad = 0; first = -1;
+      for (long i = 0; i < tot; ++i) {
+        const double s = scalar_out[(size_t)i], d = down.out_gpu[i];
+        const double rel = std::fabs(s - d) / (std::fabs(s) + 1e-3);
+        dot_maxrel = std::max(dot_maxrel, rel);
+        if (rel > 1e-6) { dot_bad++; if (first < 0) first = i; }
+      }
+      printf("[Correctness] scalar vs DP4A (down): max_rel=%.2e mismatch=%ld/%ld\n", dot_maxrel, dot_bad, tot);
+      if (first >= 0)
+        printf("    first mismatch i=%ld : scalar=%.4f dp4a=%.4f\n", first, scalar_out[(size_t)first],
+               down.out_gpu[first]);
+      printf("\n");
+
+      gpu_decode_subgroup<32, false>(q, down, 0, down.njobs).wait();
+      long sg_bad = 0;
+      for (long i = 0; i < tot; ++i) sg_bad += scalar_out[(size_t)i] != down.out_gpu[i];
+      gpu_decode_subgroup<16, true>(q, down, 0, down.njobs).wait();
+      long packed_bad = 0;
+      for (long i = 0; i < tot; ++i) packed_bad += scalar_out[(size_t)i] != down.out_gpu[i];
+      printf("[Correctness] scalar vs subgroup: nibble_mismatch=%ld packed_mismatch=%ld/%ld\n\n", sg_bad,
+             packed_bad, tot);
+
+      gpu_decode_output_lanes<8>(q, down, 0, down.njobs).wait();
+      long output8_bad = 0;
+      for (long i = 0; i < tot; ++i) output8_bad += scalar_out[(size_t)i] != down.out_gpu[i];
+      gpu_decode_output_lanes<16>(q, down, 0, down.njobs).wait();
+      long output16_bad = 0;
+      for (long i = 0; i < tot; ++i) output16_bad += scalar_out[(size_t)i] != down.out_gpu[i];
+      gpu_decode_output_lanes<32>(q, down, 0, down.njobs).wait();
+      long output32_bad = 0;
+      for (long i = 0; i < tot; ++i) output32_bad += scalar_out[(size_t)i] != down.out_gpu[i];
+      printf("[Correctness] scalar vs output-lanes: SG8=%ld SG16=%ld SG32=%ld/%ld\n\n", output8_bad,
+             output16_bad, output32_bad, tot);
+      gpu_decode_output_lanes<32, 16>(q, down, 0, down.njobs).wait();
+      long tile4_bad = 0;
+      for (long i = 0; i < tot; ++i) tile4_bad += scalar_out[(size_t)i] != down.out_gpu[i];
+      gpu_decode_output_lanes<32, 8>(q, down, 0, down.njobs).wait();
+      long tile8_bad = 0;
+      for (long i = 0; i < tot; ++i) tile8_bad += scalar_out[(size_t)i] != down.out_gpu[i];
+      gpu_decode_output_lanes<32, 4>(q, down, 0, down.njobs).wait();
+      long tile16_bad = 0;
+      for (long i = 0; i < tot; ++i) tile16_bad += scalar_out[(size_t)i] != down.out_gpu[i];
+      printf("[Correctness] scalar vs tiled SG32: outputs4=%ld outputs8=%ld outputs16=%ld/%ld\n\n", tile4_bad,
+             tile8_bad, tile16_bad, tot);
+    }
   }
 
   // ---- Test1: throughput ----
   double cpu_ms = best_ms(run_cpu, iters);
-  double gpu_ms = best_ms(run_gpu, iters);
+  double gpu_scalar_ms = best_ms(run_gpu_scalar, iters);
+  double gpu_dot_ms = M == 1 ? best_ms(run_gpu_dot, iters) : gpu_scalar_ms;
+  double gpu_sg_nibble_ms = M == 1 ? best_ms(run_gpu_sg_nibble, iters) : gpu_scalar_ms;
+  double gpu_sg_packed_ms = M == 1 ? best_ms(run_gpu_sg_packed, iters) : gpu_scalar_ms;
+  double gpu_sg_packed8_ms = M == 1 ? best_ms(run_gpu_sg_packed8, iters) : gpu_scalar_ms;
   printf("[Test1] %s: all %d experts, M=%d\n", M == 1 ? "decode" : "prefill", NE, M);
   printf("  CPU  AVX-VNNI: %8.2f ms | %7.1f tok/s | %6.1f GB/s(int8) | %6.1f GFLOP/s\n",
          cpu_ms, M * 1000.0 / cpu_ms, w8pt / GB / (cpu_ms / 1e3), gflop / (cpu_ms / 1e3));
-  printf("  iGPU SYCL   : %8.2f ms | %7.1f tok/s | %6.1f GB/s(int4) | %6.1f GFLOP/s\n",
-         gpu_ms, M * 1000.0 / gpu_ms, w4pt / GB / (gpu_ms / 1e3), gflop / (gpu_ms / 1e3));
+  printf("  iGPU scalar : %8.2f ms | %7.1f tok/s | %6.1f GB/s(int4) | %6.1f GFLOP/s\n",
+         gpu_scalar_ms, M * 1000.0 / gpu_scalar_ms, w4pt / GB / (gpu_scalar_ms / 1e3),
+         gflop / (gpu_scalar_ms / 1e3));
+  if (M == 1)
+    printf("  iGPU DP4A   : %8.2f ms | %7.1f tok/s | %6.1f GB/s(int4) | %6.1f GFLOP/s | %+.1f%%\n",
+           gpu_dot_ms, M * 1000.0 / gpu_dot_ms, w4pt / GB / (gpu_dot_ms / 1e3),
+           gflop / (gpu_dot_ms / 1e3), (gpu_scalar_ms / gpu_dot_ms - 1.0) * 100.0);
+  if (M == 1) {
+    printf("  iGPU SG32   : %8.2f ms | %7.1f tok/s | nibble-per-lane\n", gpu_sg_nibble_ms,
+           1000.0 / gpu_sg_nibble_ms);
+    printf("  iGPU SG16   : %8.2f ms | %7.1f tok/s | packed-per-lane | %+.1f%% vs SG32\n",
+           gpu_sg_packed_ms, 1000.0 / gpu_sg_packed_ms,
+           (gpu_sg_nibble_ms / gpu_sg_packed_ms - 1.0) * 100.0);
+    printf("  iGPU SG8    : %8.2f ms | %7.1f tok/s | packed-per-lane | %+.1f%% vs SG16\n",
+           gpu_sg_packed8_ms, 1000.0 / gpu_sg_packed8_ms,
+           (gpu_sg_packed_ms / gpu_sg_packed8_ms - 1.0) * 100.0);
+
+    const double down_sg_packed_ms = best_ms(run_down_sg_packed, iters);
+    const double down_output8_ms = best_ms(run_down_output8, iters);
+    const double down_output16_ms = best_ms(run_down_output16, iters);
+    const double down_output32_ms = best_ms(run_down_output32, iters);
+    const double down_tile4_ms = best_ms(run_down_tile4, iters);
+    const double down_tile8_ms = best_ms(run_down_tile8, iters);
+    const double down_tile16_ms = best_ms(run_down_tile16, iters);
+    printf("\n[Test2] down-only: all %d experts, N=%d K=%d\n", NE, down.N, down.K);
+    printf("  packed K-lanes SG16 : %8.3f ms\n", down_sg_packed_ms);
+    printf("  output-lanes SG8    : %8.3f ms | %+.1f%%\n", down_output8_ms,
+           (down_sg_packed_ms / down_output8_ms - 1.0) * 100.0);
+    printf("  output-lanes SG16   : %8.3f ms | %+.1f%%\n", down_output16_ms,
+           (down_sg_packed_ms / down_output16_ms - 1.0) * 100.0);
+    printf("  output-lanes SG32   : %8.3f ms | %+.1f%%\n", down_output32_ms,
+           (down_sg_packed_ms / down_output32_ms - 1.0) * 100.0);
+    printf("  tiled SG32 outputs4 : %8.3f ms | %+.1f%%\n", down_tile4_ms,
+           (down_sg_packed_ms / down_tile4_ms - 1.0) * 100.0);
+    printf("  tiled SG32 outputs8 : %8.3f ms | %+.1f%%\n", down_tile8_ms,
+           (down_sg_packed_ms / down_tile8_ms - 1.0) * 100.0);
+    printf("  tiled SG32 outputs16: %8.3f ms | %+.1f%%\n", down_tile16_ms,
+           (down_sg_packed_ms / down_tile16_ms - 1.0) * 100.0);
+  }
 
   if (M == 1) {  // co-issue only for decode
     double best = 1e30, bf = 0;
@@ -332,7 +575,7 @@ int main(int argc, char** argv) {
       int sp = (int)(NE * frac);
       double t = best_ms([&] {
         std::vector<event> evs;
-        for (auto* b : B) evs.push_back(gpu_decode(q, *b, sp, b->njobs));
+        for (auto* b : B) evs.push_back(gpu_decode<true>(q, *b, sp, b->njobs));
         for (auto* b : B) cpu_gemm(*b, 0, sp);
         for (auto& e : evs) e.wait();
       }, iters);

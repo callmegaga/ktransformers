@@ -5,17 +5,20 @@ import os
 # Use relative imports for package structure
 from ..experts_base import BaseMoEWrapper
 from .loader import GGUFLoader
-from kt_kernel_ext.moe import MOEConfig
+from kt_kernel import kt_kernel_ext
+
+_moe_mod = kt_kernel_ext.moe
+MOEConfig = _moe_mod.MOEConfig
 
 try:
-    from kt_kernel_ext.moe import MOE
+    MOE = _moe_mod.MOE
 
     _HAS_LLAMAFILE_SUPPORT = True
 except (ImportError, AttributeError):
     _HAS_LLAMAFILE_SUPPORT = False
     MOE = None
 
-from kt_kernel_ext.kvcache import ggml_type
+ggml_type = kt_kernel_ext.kvcache.ggml_type
 
 
 class LlamafileMoEWrapper(BaseMoEWrapper):

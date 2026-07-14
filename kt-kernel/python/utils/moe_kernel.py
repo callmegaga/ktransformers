@@ -6,17 +6,20 @@ from typing import List, Optional
 # Use relative imports for package structure
 from ..experts_base import BaseMoEWrapper
 from .loader import SafeTensorLoader
-from kt_kernel_ext.moe import MOEConfig
+from kt_kernel import kt_kernel_ext
+
+_moe_mod = kt_kernel_ext.moe
+MOEConfig = _moe_mod.MOEConfig
 
 try:
-    from kt_kernel_ext.moe import Int8_KERNEL_MOE
+    Int8_KERNEL_MOE = _moe_mod.Int8_KERNEL_MOE
 
     _HAS_INT8_SUPPORT = True
 except (ImportError, AttributeError):
     Int8_KERNEL_MOE = None
     _HAS_INT8_SUPPORT = False
 try:
-    from kt_kernel_ext.moe import Int4_KERNEL_MOE
+    Int4_KERNEL_MOE = _moe_mod.Int4_KERNEL_MOE
 
     _HAS_INT4_SUPPORT = True
 except (ImportError, AttributeError):

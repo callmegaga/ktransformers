@@ -75,6 +75,28 @@ KT_SYCL_QUEUE_IN_ORDER=0
 
 注意：当前主仓库把 `perf-log/` 识别为未跟踪的嵌套 Git 仓库。如果要提交 `35b-build-sycl-int4.sh`，需要在 `perf-log` 自己的仓库里提交，或者先明确调整仓库结构，避免在主仓库中误提交嵌入式 Git 仓库。
 
+### SGLang Qwen3 MoE timing
+
+为了定位 `TPOT` 中 MoE 专家计算之外的剩余耗时，新增了可选的 Python 侧分段计时：
+
+- `third_party/sglang/python/sglang/srt/models/qwen3_moe.py`
+  - `[KT layer timing]`：按层统计 `prepare_attn`、`attn`、`prepare_mlp`、`mlp`、`post`。
+  - `[KT model timing]`：统计 `Qwen3MoeForCausalLM.forward` 中的 model 与 logits。
+- `third_party/sglang/python/sglang/srt/model_executor/model_runner.py`
+  - `[KT runner timing]`：统计 `ModelRunner.forward` 的 raw model forward 与后处理 hook。
+  - `[KT sample timing]`：统计 logits preprocess 与 sampler。
+
+相关环境变量：
+
+```bash
+SGLANG_KT_HYBRID_TIMING=1          # 默认在 sycl-int4 启动脚本中开启
+SGLANG_KT_HYBRID_TIMING_EVERY=50   # 与 KT_MOE_DECODE_TRACE_EVERY 默认对齐
+SGLANG_KT_HYBRID_TIMING_ALL=0      # 默认只看 decode；设为 1 可包含 prefill/其他模式
+SGLANG_KT_HYBRID_TIMING_DEEP=0     # 设为 1 会插入 CUDA synchronize，诊断更准但会变慢
+```
+
+第一轮建议保持 `DEEP=0` 跑完整输出，先看 wall time 分布。如果 `[KT layer timing] avg_mlp` 与 `[MOE decode] avg_total` 接近，而 `avg_attn`、`avg_logits`、`[KT sample timing]` 或 `[KT runner timing] avg_post` 较大，就可以继续沿对应方向优化。只有在需要精确拆 CUDA 异步 kernel 归属时，再短跑 `SGLANG_KT_HYBRID_TIMING_DEEP=1`。
+
 ## 实验过程与结论
 
 不同轮次的输入长度和输出长度并不完全一致，所以 TPOT 只能做近似比较；更稳定的判断依据是 `[MOE decode]` 的单层分项耗时。
@@ -142,12 +164,12 @@ KT_SYCL_INT4_FAST_SILU=1 \
 - 总 TPOT 约 `128ms/token`。
 - 剩余约 `40ms/token` 在 MoE 外部，包括 attention、shared experts/非专家层、SGLang 调度、Python/CUDA 侧同步等。
 
-因此，后续继续优化 SYCL MoE 内部仍有空间，但边际收益会变小。下一阶段建议先把 MoE 外部耗时拆出来，确认总 TPOT 的剩余瓶颈。
+因此，后续继续优化 SYCL MoE 内部仍有空间，但边际收益会变小。下一阶段先通过 `[KT layer timing]`、`[KT model timing]`、`[KT runner timing]` 和 `[KT sample timing]` 把 MoE 外部耗时拆出来，确认总 TPOT 的剩余瓶颈。
 
 ## 后续优化方向
 
 1. 分离 MoE 外部耗时
-   - 增加或打开 attention、shared expert、scheduler 侧 timing。
+   - 打开 `SGLANG_KT_HYBRID_TIMING=1`，对齐 `[MOE decode]` 与 `[KT * timing]` 日志。
    - 判断 `~40ms/token` 主要来自哪里。
 
 2. 更深入的 iGPU dot 路径
@@ -193,4 +215,3 @@ git add kt-kernel/operators/avx2/moe_base.hpp \
         doc/SUMMARY.md
 git commit -m "Add SYCL GPTQ INT4 iGPU decode tuning path"
 ```
-
