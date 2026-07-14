@@ -64,9 +64,20 @@ inline bool queue_in_order_enabled() { return env_flag("KT_SYCL_QUEUE_IN_ORDER",
 inline bool device_weights_enabled() { return env_flag("KT_SYCL_INT4_DEVICE_WEIGHTS", false); }
 inline bool device_scratch_enabled() { return env_flag("KT_SYCL_INT4_DEVICE_SCRATCH", false); }
 inline bool fast_silu_enabled() { return env_flag("KT_SYCL_INT4_FAST_SILU", false); }
+inline bool weight_reorder_enabled() { return env_flag("KT_SYCL_INT4_WEIGHT_REORDER", false); }
 inline bool pre_kernel_ping_enabled() { return env_flag("KT_SYCL_INT4_PRE_KERNEL_PING", false); }
 inline bool shape_ping_enabled() { return env_flag("KT_SYCL_INT4_SHAPE_PING", false); }
 inline bool weight_ping_enabled() { return env_flag("KT_SYCL_INT4_WEIGHT_PING", false); }
+
+static inline size_t qweight_offset(bool output_major, int kp, int ni, int k_packed, int n) {
+  return output_major ? (size_t)ni * (size_t)k_packed + (size_t)kp
+                      : (size_t)kp * (size_t)n + (size_t)ni;
+}
+
+static inline size_t weight_scale_offset(bool output_major, int g, int ni, int num_groups, int n) {
+  return output_major ? (size_t)ni * (size_t)num_groups + (size_t)g
+                      : (size_t)g * (size_t)n + (size_t)ni;
+}
 
 inline uint64_t now_us() {
   return (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
@@ -255,9 +266,11 @@ struct GemmKernelSYCLGPTQInt4 {
         throw std::runtime_error("SYCL GPTQ-Int4 MoE requires USM shared allocation support.");
       if (device_weights_enabled() && !dev.get_info<sycl::info::device::usm_device_allocations>())
         throw std::runtime_error("SYCL GPTQ-Int4 device-weight mode requires USM device allocation support.");
-      std::printf("Created SYCL_GPTQ_INT4_MOE on device: %s (queue_profiling=%d queue_in_order=%d device_weights=%d)\n",
+      std::printf("Created SYCL_GPTQ_INT4_MOE on device: %s "
+                  "(queue_profiling=%d queue_in_order=%d device_weights=%d weight_reorder=%d)\n",
                   dev.get_info<sycl::info::device::name>().c_str(), queue_profiling_enabled() ? 1 : 0,
-                  queue_in_order_enabled() ? 1 : 0, device_weights_enabled() ? 1 : 0);
+                  queue_in_order_enabled() ? 1 : 0, device_weights_enabled() ? 1 : 0,
+                  weight_reorder_enabled() ? 1 : 0);
     });
   }
 
@@ -290,15 +303,19 @@ struct GemmKernelSYCLGPTQInt4 {
     }
   };
 
-  // BufferB: GPTQ int4 weights [K/8, N] uint32 + scales [K/gs, N] float, in USM
+  // BufferB: source GPTQ weights are [K/8, N] + [K/gs, N]. The optional decode
+  // reorder stores them as [N, K/8] + [N, K/gs], so subgroup lanes walking K
+  // read adjacent words instead of striding by N.
   struct BufferB {
-    uint32_t* qw = nullptr;   // [K/8, N]
-    float* scales = nullptr;   // [K/gs, N]
+    uint32_t* qw = nullptr;
+    float* scales = nullptr;
     int n = 0, k = 0, group_size = 128, num_groups = 0, k_packed = 0;
     bool device_storage = false;
+    bool output_major = false;
     BufferB() = default;
     BufferB(size_t n_, size_t k_, int gs, void*) : n((int)n_), k((int)k_), group_size(gs),
-                                                   device_storage(device_weights_enabled()) {
+                                                   device_storage(device_weights_enabled()),
+                                                   output_major(weight_reorder_enabled()) {
       if (group_size <= 0 || (k % 8) != 0 || (k % group_size) != 0)
         throw std::runtime_error("SYCL GPTQ-Int4: k must be divisible by 8 and group_size");
       k_packed = k / 8; num_groups = k / group_size;
@@ -328,14 +345,42 @@ struct GemmKernelSYCLGPTQInt4 {
           throw std::runtime_error("SYCL GPTQ-Int4 device-weight upload expects unsplit full matrices.");
         }
         auto& q = queue();
-        q.memcpy(qw, src_qw, qweight_bytes()).wait_and_throw();
-        q.memcpy(scales, src_sc, scales_bytes()).wait_and_throw();
+        if (output_major) {
+          std::vector<uint32_t> reordered_qw((size_t)k_packed * n);
+          std::vector<float> reordered_sc((size_t)num_groups * n);
+          for (int ni = 0; ni < n; ++ni) {
+            for (int kp = 0; kp < k_packed; ++kp) {
+              reordered_qw[(size_t)ni * k_packed + kp] = src_qw[(size_t)kp * n + ni];
+            }
+            for (int g = 0; g < num_groups; ++g) {
+              reordered_sc[(size_t)ni * num_groups + g] = src_sc[(size_t)g * n + ni];
+            }
+          }
+          q.memcpy(qw, reordered_qw.data(), qweight_bytes()).wait_and_throw();
+          q.memcpy(scales, reordered_sc.data(), scales_bytes()).wait_and_throw();
+        } else {
+          q.memcpy(qw, src_qw, qweight_bytes()).wait_and_throw();
+          q.memcpy(scales, src_sc, scales_bytes()).wait_and_throw();
+        }
         return;
       }
-      for (int kp = 0; kp < k_packed; ++kp)
-        std::memcpy(qw + (size_t)kp * n + ns, src_qw + (size_t)kp * n + ns, (size_t)nlen * sizeof(uint32_t));
-      for (int g = 0; g < num_groups; ++g)
-        std::memcpy(scales + (size_t)g * n + ns, src_sc + (size_t)g * n + ns, (size_t)nlen * sizeof(float));
+      if (output_major) {
+        for (int ni = ns; ni < ne; ++ni) {
+          for (int kp = 0; kp < k_packed; ++kp) {
+            qw[(size_t)ni * k_packed + kp] = src_qw[(size_t)kp * n + ni];
+          }
+          for (int g = 0; g < num_groups; ++g) {
+            scales[(size_t)ni * num_groups + g] = src_sc[(size_t)g * n + ni];
+          }
+        }
+      } else {
+        for (int kp = 0; kp < k_packed; ++kp)
+          std::memcpy(qw + (size_t)kp * n + ns, src_qw + (size_t)kp * n + ns,
+                      (size_t)nlen * sizeof(uint32_t));
+        for (int g = 0; g < num_groups; ++g)
+          std::memcpy(scales + (size_t)g * n + ns, src_sc + (size_t)g * n + ns,
+                      (size_t)nlen * sizeof(float));
+      }
     }
   };
 
@@ -374,7 +419,8 @@ static inline void gemm_gptq_int4_sycl(int m, int n, int k, GemmKernelSYCLGPTQIn
   auto [ns, ne] = avx2::split_range(n, ith, nth);
   if (ns >= ne) return;
   auto& q = queue();
-  const int N = b.n, gs = b.group_size, numg = b.num_groups;
+  const int N = b.n, gs = b.group_size, numg = b.num_groups, Kp = b.k_packed;
+  const bool output_major = b.output_major;
   uint16_t* a_data = a.data; uint32_t* qw = b.qw; float* sc = b.scales; float* c_data = c.data;
   const size_t a_ld = a.k, c_ld = c.n;
   const int nlen = ne - ns;
@@ -389,11 +435,11 @@ static inline void gemm_gptq_int4_sycl(int m, int n, int k, GemmKernelSYCLGPTQIn
          const int kbase = g * gs;
          for (int t = 0; t < gs; ++t) {
            const int kk = kbase + t;
-           const uint32_t packed = qw[(size_t)(kk >> 3) * N + ni];
+           const uint32_t packed = qw[qweight_offset(output_major, kk >> 3, ni, Kp, N)];
            const int w = (int)((packed >> ((kk & 7) * 4)) & 0xF) - 8;
            gdot += bf16_to_fp32(arow[kk]) * (float)w;
          }
-         acc += gdot * sc[(size_t)g * N + ni];
+         acc += gdot * sc[weight_scale_offset(output_major, g, ni, numg, N)];
        }
        c_data[(size_t)mi * c_ld + ni] = acc;
      });
@@ -410,7 +456,8 @@ static inline sycl::event gemm_gptq_int4_sycl_subgroup_submit(int m, int n, int 
   auto [ns, ne] = avx2::split_range(n, ith, nth);
   if (ns >= ne) return sycl::event{};
   auto& q = queue();
-  const int N = b.n, gs = b.group_size, numg = b.num_groups;
+  const int N = b.n, gs = b.group_size, numg = b.num_groups, Kp = b.k_packed;
+  const bool output_major = b.output_major;
   uint16_t* a_data = a.data;
   uint32_t* qw = b.qw;
   float* sc = b.scales;
@@ -433,12 +480,12 @@ static inline sycl::event gemm_gptq_int4_sycl_subgroup_submit(int m, int n, int 
          const int kbase = g * gs;
          for (int t = lane; t < gs; t += SG) {
            const int kk = kbase + t;
-           const uint32_t packed = qw[(size_t)(kk >> 3) * N + ni];
+           const uint32_t packed = qw[qweight_offset(output_major, kk >> 3, ni, Kp, N)];
            const int w = (int)((packed >> ((kk & 7) * 4)) & 0xF) - 8;
            partial += bf16_to_fp32(arow[kk]) * (float)w;
          }
          const float group_sum = sycl::reduce_over_group(it.get_sub_group(), partial, sycl::plus<float>());
-         if (lane == 0) acc += group_sum * sc[(size_t)g * N + ni];
+         if (lane == 0) acc += group_sum * sc[weight_scale_offset(output_major, g, ni, numg, N)];
        }
        if (lane == 0) c_data[(size_t)mi * c_ld + ni] = acc;
      });
@@ -453,7 +500,8 @@ static inline sycl::event gemm_gptq_int4_sycl_subgroup_packed_submit(
   auto [ns, ne] = avx2::split_range(n, ith, nth);
   if (ns >= ne) return sycl::event{};
   auto& q = queue();
-  const int N = b.n, gs = b.group_size, numg = b.num_groups;
+  const int N = b.n, gs = b.group_size, numg = b.num_groups, Kp = b.k_packed;
+  const bool output_major = b.output_major;
   const int packed_per_group = gs / 8;
   uint16_t* a_data = a.data;
   uint32_t* qw = b.qw;
@@ -477,7 +525,7 @@ static inline sycl::event gemm_gptq_int4_sycl_subgroup_packed_submit(
         const int kp_base = g * packed_per_group;
         for (int kpi = lane; kpi < packed_per_group; kpi += SG) {
           const int kp = kp_base + kpi;
-          const uint32_t packed = qw[(size_t)kp * N + ni];
+          const uint32_t packed = qw[qweight_offset(output_major, kp, ni, Kp, N)];
           const uint16_t* xb = arow + (size_t)kp * 8;
 #pragma unroll
           for (int bb = 0; bb < 8; ++bb) {
@@ -486,7 +534,7 @@ static inline sycl::event gemm_gptq_int4_sycl_subgroup_packed_submit(
           }
         }
         const float group_sum = sycl::reduce_over_group(it.get_sub_group(), partial, sycl::plus<float>());
-        if (lane == 0) acc += group_sum * sc[(size_t)g * N + ni];
+        if (lane == 0) acc += group_sum * sc[weight_scale_offset(output_major, g, ni, numg, N)];
       }
       if (lane == 0) c_data[(size_t)mi * c_ld + ni] = acc;
     });
@@ -556,11 +604,12 @@ static inline sycl::event gate_up_activation_gptq_int4_sycl_subgroup_submit(
     float swiglu_alpha, bool fast_silu) {
   if (m <= 0 || n <= 0 || k <= 0) return sycl::event{};
   if (gate_b.n != n || up_b.n != n || gate_b.k != k || up_b.k != k ||
-      gate_b.group_size != up_b.group_size) {
+      gate_b.group_size != up_b.group_size || gate_b.output_major != up_b.output_major) {
     throw std::runtime_error("SYCL GPTQ-Int4 gate_up activation fuse: incompatible gate/up shapes");
   }
   auto& q = queue();
-  const int N = gate_b.n, gs = gate_b.group_size, numg = gate_b.num_groups;
+  const int N = gate_b.n, gs = gate_b.group_size, numg = gate_b.num_groups, Kp = gate_b.k_packed;
+  const bool output_major = gate_b.output_major;
   const int packed_per_group = gs / 8;
   uint16_t* a_data = a.data;
   uint32_t* gqw = gate_b.qw;
@@ -588,8 +637,8 @@ static inline sycl::event gate_up_activation_gptq_int4_sycl_subgroup_submit(
            const int kp_base = g * packed_per_group;
            for (int kpi = lane; kpi < packed_per_group; kpi += SG) {
              const int kp = kp_base + kpi;
-             const uint32_t pg = gqw[(size_t)kp * N + ni];
-             const uint32_t pu = uqw[(size_t)kp * N + ni];
+             const uint32_t pg = gqw[qweight_offset(output_major, kp, ni, Kp, N)];
+             const uint32_t pu = uqw[qweight_offset(output_major, kp, ni, Kp, N)];
              const uint16_t* xb = arow + (size_t)kp * 8;
 #pragma unroll
              for (int bb = 0; bb < 8; ++bb) {
@@ -604,8 +653,8 @@ static inline sycl::event gate_up_activation_gptq_int4_sycl_subgroup_submit(
              const int kk = kbase + t;
              const int shift = (kk & 7) * 4;
              const float xv = bf16_to_fp32(arow[kk]);
-             const uint32_t pg = gqw[(size_t)(kk >> 3) * N + ni];
-             const uint32_t pu = uqw[(size_t)(kk >> 3) * N + ni];
+             const uint32_t pg = gqw[qweight_offset(output_major, kk >> 3, ni, Kp, N)];
+             const uint32_t pu = uqw[qweight_offset(output_major, kk >> 3, ni, Kp, N)];
              gate_partial += xv * (float)((int)((pg >> shift) & 0xFu) - 8);
              up_partial += xv * (float)((int)((pu >> shift) & 0xFu) - 8);
            }
@@ -613,8 +662,8 @@ static inline sycl::event gate_up_activation_gptq_int4_sycl_subgroup_submit(
          const float gate_sum = sycl::reduce_over_group(it.get_sub_group(), gate_partial, sycl::plus<float>());
          const float up_sum = sycl::reduce_over_group(it.get_sub_group(), up_partial, sycl::plus<float>());
          if (lane == 0) {
-           gate_acc += gate_sum * gsc[(size_t)g * N + ni];
-           up_acc += up_sum * usc[(size_t)g * N + ni];
+           gate_acc += gate_sum * gsc[weight_scale_offset(output_major, g, ni, numg, N)];
+           up_acc += up_sum * usc[weight_scale_offset(output_major, g, ni, numg, N)];
          }
        }
        if (lane == 0) {
@@ -721,11 +770,12 @@ static inline sycl::event gate_up_activation_gptq_int4_sycl_subgroup_q8_submit(
     throw std::runtime_error("SYCL GPTQ-Int4 q8 gate_up activation fuse currently supports decode m=1 only");
   }
   if (gate_b.n != n || up_b.n != n || gate_b.k != k || up_b.k != k ||
-      gate_b.group_size != up_b.group_size) {
+      gate_b.group_size != up_b.group_size || gate_b.output_major != up_b.output_major) {
     throw std::runtime_error("SYCL GPTQ-Int4 q8 gate_up activation fuse: incompatible gate/up shapes");
   }
   auto& q = queue();
-  const int N = gate_b.n, gs = gate_b.group_size, numg = gate_b.num_groups;
+  const int N = gate_b.n, gs = gate_b.group_size, numg = gate_b.num_groups, Kp = gate_b.k_packed;
+  const bool output_major = gate_b.output_major;
   const int packed_per_group = gs / 8;
   uint32_t* gqw = gate_b.qw;
   uint32_t* uqw = up_b.qw;
@@ -746,8 +796,8 @@ static inline sycl::event gate_up_activation_gptq_int4_sycl_subgroup_q8_submit(
          const int kp_base = g * packed_per_group;
          for (int kpi = lane; kpi < packed_per_group; kpi += SG) {
            const int kp = kp_base + kpi;
-           const uint32_t pg = gqw[(size_t)kp * N + ni];
-           const uint32_t pu = uqw[(size_t)kp * N + ni];
+           const uint32_t pg = gqw[qweight_offset(output_major, kp, ni, Kp, N)];
+           const uint32_t pu = uqw[qweight_offset(output_major, kp, ni, Kp, N)];
            const int8_t* xb = xq + (size_t)kp * 8;
 #pragma unroll
            for (int bb = 0; bb < 8; ++bb) {
@@ -760,8 +810,9 @@ static inline sycl::event gate_up_activation_gptq_int4_sycl_subgroup_q8_submit(
          const int gate_sum = sycl::reduce_over_group(it.get_sub_group(), gate_partial, sycl::plus<int>());
          const int up_sum = sycl::reduce_over_group(it.get_sub_group(), up_partial, sycl::plus<int>());
          if (lane == 0) {
-           gate_acc += (float)gate_sum * xs[g] * gsc[(size_t)g * N + ni];
-           up_acc += (float)up_sum * xs[g] * usc[(size_t)g * N + ni];
+           gate_acc +=
+               (float)gate_sum * xs[g] * gsc[weight_scale_offset(output_major, g, ni, numg, N)];
+           up_acc += (float)up_sum * xs[g] * usc[weight_scale_offset(output_major, g, ni, numg, N)];
          }
        }
        if (lane == 0) {
@@ -818,6 +869,8 @@ static inline void gate_up_activation_gptq_int4_sycl_subgroup_batched(
   auto& q = queue();
   const int gs = group_size;
   const int numg = k / gs;
+  const int Kp = k / 8;
+  const bool output_major = weight_reorder_enabled();
   const size_t per_active = (size_t)m * (size_t)n;
   const size_t groups = (size_t)active * per_active;
   q.submit([&](sycl::handler& h) {
@@ -844,16 +897,16 @@ static inline void gate_up_activation_gptq_int4_sycl_subgroup_batched(
            const int kk = kbase + t;
            const int shift = (kk & 7) * 4;
            const float xv = bf16_to_fp32(arow[kk]);
-           const uint32_t pg = gqw[(size_t)(kk >> 3) * (size_t)n + (size_t)ni];
-           const uint32_t pu = uqw[(size_t)(kk >> 3) * (size_t)n + (size_t)ni];
+           const uint32_t pg = gqw[qweight_offset(output_major, kk >> 3, ni, Kp, n)];
+           const uint32_t pu = uqw[qweight_offset(output_major, kk >> 3, ni, Kp, n)];
            gate_partial += xv * (float)((int)((pg >> shift) & 0xFu) - 8);
            up_partial += xv * (float)((int)((pu >> shift) & 0xFu) - 8);
          }
          const float gate_sum = sycl::reduce_over_group(it.get_sub_group(), gate_partial, sycl::plus<float>());
          const float up_sum = sycl::reduce_over_group(it.get_sub_group(), up_partial, sycl::plus<float>());
          if (lane == 0) {
-           gate_acc += gate_sum * gsc[(size_t)g * (size_t)n + (size_t)ni];
-           up_acc += up_sum * usc[(size_t)g * (size_t)n + (size_t)ni];
+           gate_acc += gate_sum * gsc[weight_scale_offset(output_major, g, ni, numg, n)];
+           up_acc += up_sum * usc[weight_scale_offset(output_major, g, ni, numg, n)];
          }
        }
        if (lane == 0) {
@@ -1421,6 +1474,7 @@ class SYCL_GPTQ_INT4_MOE_TP : public AVX2_MOE_BASE<T, SYCL_GPTQ_INT4_MOE_TP<T>> 
     const bool trace = trace_every > 0;
     const bool profile_events = trace && sycl_int4::queue_profiling_enabled();
     const bool fast_silu = sycl_int4::fast_silu_enabled();
+    const bool output_major = sycl_int4::weight_reorder_enabled();
     const bool pre_kernel_ping = sycl_int4::pre_kernel_ping_enabled();
     const bool shape_ping = sycl_int4::shape_ping_enabled();
     const bool weight_ping = sycl_int4::weight_ping_enabled();
@@ -1565,8 +1619,8 @@ class SYCL_GPTQ_INT4_MOE_TP : public AVX2_MOE_BASE<T, SYCL_GPTQ_INT4_MOE_TP<T>> 
           int gd = 0, ud = 0;
           const int kp0 = g * packed_per_group;
           for (int kp = kp0; kp < kp0 + packed_per_group; ++kp) {
-            const uint32_t pg = wg[(size_t)kp * I + i];
-            const uint32_t pu = wu[(size_t)kp * I + i];
+            const uint32_t pg = wg[sycl_int4::qweight_offset(output_major, kp, i, H / 8, I)];
+            const uint32_t pu = wu[sycl_int4::qweight_offset(output_major, kp, i, H / 8, I)];
             const int8_t* xb = xq + (size_t)kp * 8;
 #pragma unroll
             for (int bb = 0; bb < 8; ++bb) {
@@ -1575,8 +1629,8 @@ class SYCL_GPTQ_INT4_MOE_TP : public AVX2_MOE_BASE<T, SYCL_GPTQ_INT4_MOE_TP<T>> 
               ud += xv * ((int)((pu >> (bb * 4)) & 0xF) - 8);
             }
           }
-          gsum += (float)gd * xs[g] * sg[(size_t)g * I + i];
-          usum += (float)ud * xs[g] * su[(size_t)g * I + i];
+          gsum += (float)gd * xs[g] * sg[sycl_int4::weight_scale_offset(output_major, g, i, ngH, I)];
+          usum += (float)ud * xs[g] * su[sycl_int4::weight_scale_offset(output_major, g, i, ngH, I)];
         }
         const float gg = fast_silu
                              ? (gsum > 20.f ? gsum
@@ -1612,14 +1666,15 @@ class SYCL_GPTQ_INT4_MOE_TP : public AVX2_MOE_BASE<T, SYCL_GPTQ_INT4_MOE_TP<T>> 
           int dot = 0;
           const int kp0 = g * packed_per_group;
           for (int kp = kp0; kp < kp0 + packed_per_group; ++kp) {
-            const uint32_t pd = wd[(size_t)kp * H + hh];
+            const uint32_t pd = wd[sycl_int4::qweight_offset(output_major, kp, hh, I / 8, H)];
             const int8_t* ab = aq + (size_t)a * I + (size_t)kp * 8;
 #pragma unroll
             for (int bb = 0; bb < 8; ++bb) {
               dot += (int)ab[bb] * ((int)((pd >> (bb * 4)) & 0xF) - 8);
             }
           }
-          acc += (float)dot * as[(size_t)a * ngI + g] * sd[(size_t)g * H + hh];
+          acc += (float)dot * as[(size_t)a * ngI + g] *
+                 sd[sycl_int4::weight_scale_offset(output_major, g, hh, ngI, H)];
         }
         sycl::atomic_ref<float, sycl::memory_order::relaxed, sycl::memory_scope::device,
                          sycl::access::address_space::global_space>
@@ -1885,8 +1940,10 @@ class SYCL_GPTQ_INT4_MOE_TP : public AVX2_MOE_BASE<T, SYCL_GPTQ_INT4_MOE_TP<T>> 
 #pragma unroll
                  for (int kpi = 0; kpi < FPACK; ++kpi) {
                    const int kp = kp0 + kpi;
-                   const uint32_t pg = wg[(size_t)kp * FI + i];
-                   const uint32_t pu = wu[(size_t)kp * FI + i];
+                   const uint32_t pg =
+                       wg[sycl_int4::qweight_offset(output_major, kp, i, FH / 8, FI)];
+                   const uint32_t pu =
+                       wu[sycl_int4::qweight_offset(output_major, kp, i, FH / 8, FI)];
                    const int8_t* xb = xq + (size_t)kp * 8;
 #pragma unroll
                    for (int bb = 0; bb < 8; ++bb) {
@@ -1895,8 +1952,10 @@ class SYCL_GPTQ_INT4_MOE_TP : public AVX2_MOE_BASE<T, SYCL_GPTQ_INT4_MOE_TP<T>> 
                      ud += xv * ((int)((pu >> (bb * 4)) & 0xF) - 8);
                    }
                  }
-                 gsum += (float)gd * xs[g] * sg[(size_t)g * FI + i];
-                 usum += (float)ud * xs[g] * su[(size_t)g * FI + i];
+                 gsum += (float)gd * xs[g] *
+                         sg[sycl_int4::weight_scale_offset(output_major, g, i, FNGH, FI)];
+                 usum += (float)ud * xs[g] *
+                         su[sycl_int4::weight_scale_offset(output_major, g, i, FNGH, FI)];
                }
                const float gg = fast_silu
                                     ? (gsum > 20.f ? gsum
@@ -1930,14 +1989,16 @@ class SYCL_GPTQ_INT4_MOE_TP : public AVX2_MOE_BASE<T, SYCL_GPTQ_INT4_MOE_TP<T>> 
 #pragma unroll
                  for (int kpi = 0; kpi < FPACK; ++kpi) {
                    const int kp = kp0 + kpi;
-                   const uint32_t pd = wd[(size_t)kp * FH + hh];
+                   const uint32_t pd =
+                       wd[sycl_int4::qweight_offset(output_major, kp, hh, FI / 8, FH)];
                    const int8_t* ab = &actq[kp * 8];
 #pragma unroll
                    for (int bb = 0; bb < 8; ++bb) {
                      dot += (int)ab[bb] * ((int)((pd >> (bb * 4)) & 0xF) - 8);
                    }
                  }
-                 acc += (float)dot * ascl[g] * sd[(size_t)g * FH + hh];
+                 acc += (float)dot * ascl[g] *
+                        sd[sycl_int4::weight_scale_offset(output_major, g, hh, FNGI, FH)];
                }
                sycl::atomic_ref<float, sycl::memory_order::relaxed, sycl::memory_scope::device,
                                 sycl::access::address_space::global_space>
@@ -2072,8 +2133,10 @@ class SYCL_GPTQ_INT4_MOE_TP : public AVX2_MOE_BASE<T, SYCL_GPTQ_INT4_MOE_TP<T>> 
                int gd = 0, ud = 0;
                const int kp0 = g * packed_per_group;
                for (int kp = kp0; kp < kp0 + packed_per_group; ++kp) {
-                 const uint32_t pg = wg[(size_t)kp * I + i];
-                 const uint32_t pu = wu[(size_t)kp * I + i];
+                 const uint32_t pg =
+                     wg[sycl_int4::qweight_offset(output_major, kp, i, H / 8, I)];
+                 const uint32_t pu =
+                     wu[sycl_int4::qweight_offset(output_major, kp, i, H / 8, I)];
                  const int8_t* xb = xq + (size_t)kp * 8;
 #pragma unroll
                  for (int bb = 0; bb < 8; ++bb) {
@@ -2082,8 +2145,10 @@ class SYCL_GPTQ_INT4_MOE_TP : public AVX2_MOE_BASE<T, SYCL_GPTQ_INT4_MOE_TP<T>> 
                    ud += xv * ((int)((pu >> (bb * 4)) & 0xF) - 8);
                  }
                }
-               gsum += (float)gd * xs[g] * sg[(size_t)g * I + i];
-               usum += (float)ud * xs[g] * su[(size_t)g * I + i];
+               gsum += (float)gd * xs[g] *
+                       sg[sycl_int4::weight_scale_offset(output_major, g, i, ngH, I)];
+               usum += (float)ud * xs[g] *
+                       su[sycl_int4::weight_scale_offset(output_major, g, i, ngH, I)];
              }
              float gg = fast_silu
                             ? (gsum > 20.f ? gsum
@@ -2112,14 +2177,16 @@ class SYCL_GPTQ_INT4_MOE_TP : public AVX2_MOE_BASE<T, SYCL_GPTQ_INT4_MOE_TP<T>> 
                int dot = 0;
                const int kp0 = g * packed_per_group;
                for (int kp = kp0; kp < kp0 + packed_per_group; ++kp) {
-                 const uint32_t pd = wd[(size_t)kp * H + hh];
+                 const uint32_t pd =
+                     wd[sycl_int4::qweight_offset(output_major, kp, hh, I / 8, H)];
                  const int8_t* ab = &actq[kp * 8];
 #pragma unroll
                  for (int bb = 0; bb < 8; ++bb) {
                    dot += (int)ab[bb] * ((int)((pd >> (bb * 4)) & 0xF) - 8);
                  }
                }
-               acc += (float)dot * ascl[g] * sd[(size_t)g * H + hh];
+               acc += (float)dot * ascl[g] *
+                      sd[sycl_int4::weight_scale_offset(output_major, g, hh, ngI, H)];
              }
              sycl::atomic_ref<float, sycl::memory_order::relaxed, sycl::memory_scope::device,
                               sycl::access::address_space::global_space>
@@ -2197,13 +2264,15 @@ class SYCL_GPTQ_INT4_MOE_TP : public AVX2_MOE_BASE<T, SYCL_GPTQ_INT4_MOE_TP<T>> 
                int kk = kb + t;
                float xv = sycl_int4::bf16_to_fp32(x[kk]);
                int sh = (kk & 7) * 4;
-               uint32_t pgk = wg[(size_t)(kk >> 3) * I + i];
-               uint32_t puk = wu[(size_t)(kk >> 3) * I + i];
+               uint32_t pgk =
+                   wg[sycl_int4::qweight_offset(output_major, kk >> 3, i, H / 8, I)];
+               uint32_t puk =
+                   wu[sycl_int4::qweight_offset(output_major, kk >> 3, i, H / 8, I)];
                gd += xv * (float)((int)((pgk >> sh) & 0xF) - 8);
                ud += xv * (float)((int)((puk >> sh) & 0xF) - 8);
              }
-             gsum += gd * sg[(size_t)g * I + i];
-             usum += ud * su[(size_t)g * I + i];
+             gsum += gd * sg[sycl_int4::weight_scale_offset(output_major, g, i, ngH, I)];
+             usum += ud * su[sycl_int4::weight_scale_offset(output_major, g, i, ngH, I)];
            }
            float gg = fast_silu
                           ? (gsum > 20.f ? gsum
@@ -2219,10 +2288,11 @@ class SYCL_GPTQ_INT4_MOE_TP : public AVX2_MOE_BASE<T, SYCL_GPTQ_INT4_MOE_TP<T>> 
              int kb = g * gs; float dd = 0.f;
              for (int t = 0; t < gs; ++t) {
                int kk = kb + t;
-               uint32_t pdk = wd[(size_t)(kk >> 3) * H + hh];
+               uint32_t pdk =
+                   wd[sycl_int4::qweight_offset(output_major, kk >> 3, hh, I / 8, H)];
                dd += act[kk] * (float)((int)((pdk >> ((kk & 7) * 4)) & 0xF) - 8);
              }
-             acc += dd * sd[(size_t)g * H + hh];
+             acc += dd * sd[sycl_int4::weight_scale_offset(output_major, g, hh, ngI, H)];
            }
            sycl::atomic_ref<float, sycl::memory_order::relaxed, sycl::memory_scope::device,
                             sycl::access::address_space::global_space>
