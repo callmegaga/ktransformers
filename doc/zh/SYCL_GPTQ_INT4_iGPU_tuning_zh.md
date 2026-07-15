@@ -1,29 +1,109 @@
-# SYCL_GPTQ_INT4 iGPU 后端调优记录
+# SYCL GPTQ INT4 iGPU 后端实现与调优记录
 
-本文记录在 Intel iGPU 上为 `SYCL_GPTQ_INT4` MoE 专家后端做的一轮增量调优。目标是让
-`/home/wy/Work/models/Qwen3.5-35B-A3B-GPTQ-Int4` 在 CPU + iGPU 混合推理框架中更稳定、更快地执行专家计算，并保留足够的诊断开关，便于后续继续优化。
+本文记录 KTransformers 在 Linux + Intel 集成显卡上实现和优化 `SYCL_GPTQ_INT4`
+MoE 专家后端的过程。测试模型为 Qwen3.5-35B-A3B-GPTQ-Int4，工作负载重点是
+decode 阶段的 `M=1` 稀疏专家计算。
 
-日期：2026-07-13
+最后更新：2026-07-15
 
-## 背景
+## 最终结论
 
-原始想法是把 MoE 专家计算从 CPU AVX2/VNNI 路径扩展到 CPU 集成显卡上。iGPU 理论上更适合矩阵计算，但本模型的 decode 阶段是 `M=1` 的大量小矩阵专家计算，实际瓶颈不只是算力，还包括：
+本轮优化已经达到预期。最终固定 1000-token decode 测试结果为：
 
-- SYCL/OpenCL/Level-Zero 的 kernel 提交和排队延迟。
-- iGPU 访问共享内存中的 GPTQ 权重的延迟。
-- 大 fused kernel 在 Intel iGPU 上触发的调度等待。
-- MoE top-k 专家稀疏访问导致 batch 化收益有限。
+```text
+Run 1: Total: 54270ms | TTFT: 115ms | TPOT: 54.2ms | In: 1 | Out: 1000
+Run 2: Total: 53547ms | TTFT: 112ms | TPOT: 53.5ms | In: 1 | Out: 1000
+```
 
-本轮调优后的稳定推荐路径是：保留小 kernel per expert，减少 CPU 中间拷贝和等待点，通过 async submit 和有限 pipeline 覆盖部分提交/执行延迟。
+平均 TPOT 为 `53.85 ms`，约等于 `18.6 token/s`。同一次服务端测试中的模型内部计时为：
 
-## 主要代码变动
+```text
+[KT model timing] mode=decode calls=2000 avg_total=53.170ms
+avg_layers=53.154ms avg_tokens=1.00 deep=0
+```
 
-### `kt-kernel/operators/avx2/moe_base.hpp`
+40 层 MoE decode 日志在 `calls=1900` 时的平均值为：
 
-新增 decode 分阶段计时：
+```text
+avg_total=0.659ms/layer
+avg_gate_up_submit=0.058ms/layer
+avg_down=0.582ms/layer
+avg_active=7.35
+```
 
-- 环境变量：`KT_MOE_DECODE_TRACE_EVERY`
-- 日志格式：
+pipeline 模式下，`avg_gate_up` 主要记录异步提交时间；尚未完成的 gate/up 执行会在依赖它的
+down 阶段等待，因此性能判断应以 `avg_total` 和最终 TPOT 为主。
+
+最终采用的组合是：
+
+- gate/up 融合，并对 active experts 异步提交。
+- down projection 异步提交。
+- gate/up 到 down 使用 event dependency 形成小 kernel pipeline。
+- gate/up 和 down 都使用 packed INT4 subgroup kernel，subgroup size 为 16。
+- GPTQ 权重在加载时重排为 output-major 布局。
+- 每层专家权重使用连续 USM slab。
+- down kernel 每个 work-group 放置两个 subgroup，即同时处理两行输出。
+- 权重保留在 shared USM；device USM、Q8/DP4A 和 active-expert 单 launch 默认关闭。
+
+## 测试环境与工作负载特点
+
+主要测试环境：
+
+- Linux。
+- Intel oneAPI DPC++/C++ 2026.1。
+- Intel iGPU，SYCL Level Zero backend。
+- Qwen3.5-35B-A3B-GPTQ-Int4。
+- `hidden_size=2048`、`moe_intermediate_size=512`、`group_size=128`。
+- 每个 token 最多路由 8 个专家，实测 active expert 平均约 7.3。
+
+decode 阶段不是大矩阵 GEMM，而是大量 `M=1` GEMV：
+
+```text
+gate/up: N=512,  K=2048
+down:    N=2048, K=512
+```
+
+这种工作负载主要受以下因素限制：
+
+- INT4 权重读取和内存访问合并效率。
+- 数百个小 kernel 的提交、排队和依赖管理成本。
+- 稀疏专家权重在共享内存中的访问局部性。
+- iGPU 与 CPU 共享物理内存时，不同 USM allocation 类型带来的映射和调度差异。
+
+因此，大 batch 或更高理论整数算力并不一定更快；布局、访问模式和提交粒度更关键。
+
+## 从 llama.cpp SYCL 后端借鉴的设计
+
+对比了 llama.cpp 的 Linux SYCL MMVQ 和 MoE 实现，重点包括：
+
+- 对量化权重做一次性 reorder，使 subgroup lane 读取连续数据。
+- 将量化 block 中的不同字段组织为更适合 device 读取的 SoA/重排布局。
+- Q8 激活量化与 DP4A 向量点积。
+- 在 MoE 路径中把 expert 作为 ND-range 维度，并提供 fused expert-ID GEMV。
+- 使用 subgroup reduction，让一个 subgroup 协作计算一行输出。
+
+KTransformers 没有直接照搬全部策略，而是逐项验证：
+
+- 权重 reorder 对本项目收益最大，正式保留。
+- 连续专家权重 slab 和 subgroup 内多输出行有稳定收益，正式保留。
+- Q8 + DP4A 在当前 GPTQ 布局和 iGPU 上没有收益，默认关闭。
+- active experts 单 kernel 会破坏当前访问局部性并放大调度问题，默认关闭。
+- Level Zero immediate command list 和 in-order queue 均未带来收益。
+
+这说明 llama.cpp 的优化思路可以借鉴，但 kernel 粒度和量化格式必须结合本项目的模型形状重新调优。
+
+## 核心实现
+
+### 1. Decode 分阶段 hook 与计时
+
+`kt-kernel/operators/avx2/moe_base.hpp` 为派生后端提供：
+
+- `use_fused_gate_up_decode()`
+- `decode_gate_up_activation(...)`
+- `use_fused_down_decode()`
+- `decode_down_projection(...)`
+
+同时通过 `KT_MOE_DECODE_TRACE_EVERY` 输出：
 
 ```text
 [MOE decode] layer=... avg_total=... avg_setup=... avg_pack=...
@@ -31,187 +111,319 @@ avg_gate_up=... avg_activation=... avg_down_pack=... avg_down=...
 avg_merge=... avg_active=... gate_up_fused=...
 ```
 
-新增后端扩展 hook：
+这些 hook 让 SYCL 后端可以替换 decode 的 gate/up、activation 和 down 流程，同时不改变其他
+AVX2/AMX 后端。
 
-- `use_fused_gate_up_decode()`
-- `decode_gate_up_activation(...)`
-- `use_fused_down_decode()`
-- `decode_down_projection(...)`
+### 2. Gate/up 融合和异步 pipeline
 
-这些 hook 允许 SYCL 后端在 decode 阶段替换默认的 CPU activation / down pack / worker-pool GEMM 流程，同时不影响其他 AVX2/AMX 后端的默认行为。
+每个 active expert 的 gate 和 up projection 在同一 kernel 内计算，共享输入读取，并直接完成
+SwiGLU/SiLU activation，输出到 down projection 的输入缓冲。这样消除了：
 
-### `kt-kernel/operators/sycl/gptq_int4_sycl-moe.hpp`
+- gate 和 up 两次独立 kernel 提交。
+- 中间结果回到 CPU。
+- CPU activation。
+- activation 后再次 pack 到 down 输入。
 
-新增或强化的实验路径：
+所有 active expert kernel 先异步 submit。down kernel 依赖对应 expert 的 gate/up event，不需要先等待
+所有 gate/up 完成，从而形成细粒度 pipeline。
 
-- `per_gemm + subgroup`：每个专家一个小 GEMM kernel，适配 decode 的 `M=1`。
-- `gate_up_fuse`：把 gate GEMM、up GEMM 和 activation 合并到每个专家的小 kernel 内，直接写入 `down_ba_`。
-- `gate_up_async`：每个 active expert 的 gate/up 小 kernel 全部 submit 后统一等待。
-- `down_async`：每个 active expert 的 down 小 kernel 全部 submit 后统一等待，再拷回 CPU merge 缓冲。
-- `gate_up_down_pipeline`：down kernel 依赖对应 expert 的 gate/up event 提交，避免所有 gate/up 完成后才开始 down。
-- `fast_silu`：使用 `sycl::native::exp` 的 SiLU 近似路径。
-- `gate_up_q8`：实验性 q8 激活 + int4 权重整数累加路径，当前验证为变慢，默认关闭。
+### 3. Packed subgroup kernel
 
-同时保留了之前用于诊断的大 fused 路径、device scratch、device cache、queue profiling 等开关。它们对定位瓶颈有帮助，但不是当前推荐默认路径。
+GPTQ INT4 权重以一个 `uint32_t` 保存 8 个 4-bit 值。packed kernel 让 subgroup lane 每次读取一个
+完整 packed word，再在寄存器中解包 8 个 nibble，减少循环和地址计算。
 
-### `perf-log/35b-build-sycl-int4.sh`
+最终 gate/up 和 down 都使用：
 
-脚本中加入并转发本轮调优相关环境变量。当前推荐默认值：
+```bash
+KT_SYCL_INT4_GATE_UP_PACKED=1
+KT_SYCL_INT4_GATE_UP_PACKED_SUBGROUP=16
+KT_SYCL_INT4_DOWN_PACKED=1
+KT_SYCL_INT4_DOWN_PACKED_SUBGROUP=16
+```
+
+### 4. Output-major 权重重排
+
+原始 GPTQ 布局为：
+
+```text
+qweight: [K/8, N]
+scales:  [K/group_size, N]
+```
+
+加载到 SYCL buffer 时重排为：
+
+```text
+qweight: [N, K/8]
+scales:  [N, K/group_size]
+```
+
+对于 `group_size=128` 和 SG16，一个 group 正好包含 16 个 packed `uint32_t`。重排后 16 个
+subgroup lane 可以读取同一输出行中连续的 16 个 word，避免原布局中以 `N` 为跨度的离散访问。
+
+这是后半段调优中最重要的优化。启用后，一次非定长完整模型测试从约 `112 ms TPOT` 降到：
+
+```text
+Total: 91341ms | TTFT: 3199ms | TPOT: 68.9ms | In: 4 | Out: 1283
+```
+
+对应环境变量：
+
+```bash
+KT_SYCL_INT4_WEIGHT_REORDER=1
+```
+
+### 5. 连续专家权重 slab
+
+每一层的 gate、up、down 专家权重分别放入连续 USM slab，各 expert 的 `BufferB` 绑定到 slab
+中的固定 offset。该设计减少了大量独立 USM allocation，改善了映射、页表和权重地址管理。
+
+需要区分：连续权重 slab 只是存储优化，不代表把所有 active experts 合并为一个 kernel。最终路径仍然
+保留每个 expert 的小 kernel 异步提交。
+
+对应环境变量：
+
+```bash
+KT_SYCL_INT4_CONTIGUOUS_WEIGHTS=1
+KT_SYCL_INT4_EXPERT_BATCH=0
+```
+
+### 6. Down WG2
+
+down projection 使用 SG16。最终让一个 work-group 包含两个 subgroup，每个 subgroup 负责一行输出：
+
+```bash
+KT_SYCL_INT4_DOWN_WG_ROWS=2
+```
+
+这减少了极小 work-group 的数量，并保持相邻输出行的权重访问和 activation cache 局部性。WG4、WG8、
+WG16 和 WG32 在微基准中没有继续改善，WG2 是当前稳定默认值。
+
+## 测试方法的修正
+
+早期测试让模型自由生成到 EOS，不同轮次的输出 token 数可能相差很大，TPOT 会受到生成内容、频率变化、
+热机状态和统计区间影响。因此早期结果只能用于发现数量级变化，不能用于小于几个百分点的 A/B。
+
+后续新增 `perf-log/fixed-decode.py`，固定：
+
+```text
+temperature=0
+seed=0
+ignore_eos=true
+max_tokens=1000
+repeats=2
+```
+
+运行方式：
+
+```bash
+python perf-log/fixed-decode.py --max-tokens 1000 --repeats 2
+```
+
+后续所有小幅优化都应使用该方法，并同时比较：
+
+- 两次客户端 TPOT。
+- `[KT model timing]` 的长期累计值。
+- 40 层 `[MOE decode]` 的平均值。
+- active expert 数量是否接近。
+
+## 优化实验汇总
+
+下表中的早期 TPOT 来自不同输出长度，只用于展示优化方向；最终 fixed decode 才是严格结果。
+
+| 实验 | 代表结果 | 结论 |
+| --- | --- | --- |
+| per-expert gate/up 融合、async down、event pipeline、fast SiLU | 早期 TPOT 从约 `214 ms` 降至约 `128 ms` | 有效，作为后续基线 |
+| packed gate/up 与 packed down | TPOT 进入约 `112 ms` 区间 | 有效，保留 |
+| output-major weight reorder | 单次 TPOT `68.9 ms` | 最大新增收益，保留 |
+| 连续专家权重 slab | 单次 TPOT 约 `55.7 ms` | 有效，保留 |
+| down WG2 | 非定长测试约 `51-53 ms`；fixed decode 平均 `53.85 ms` | 有稳定收益，保留 |
+| output-lane：一 lane/输出 | TPOT 约 `55.5 ms` | 退化，关闭 |
+| output-lane：四 lanes/输出 | TPOT 约 `54.4 ms` | 无稳定收益，关闭 |
+| active experts 单 launch | 修正调度异常后 TPOT 仍约 `71.5 ms` | 明显慢于 per-expert async，关闭 |
+| all-device USM weights | down 变快但 gate/up 明显变慢 | 无净收益，关闭 |
+| down-only device USM | fixed decode 平均 `53.60 ms`，模型内部 `53.164 ms` | 与纯 shared 等价，关闭 |
+| Level Zero immediate command list | 多专家微基准 `0.454 -> 0.531 ms` | 慢约 17%，关闭 |
+| in-order queue | 微基准略慢 | 关闭 |
+| 静态固定形状 kernel | 通用与静态 WG2 都约 `0.285 ms` | 已受权重带宽限制，无收益 |
+| FP16 scale 存储 | down-only 微基准约 2% 收益 | 整机预期低于 1%，未集成 |
+
+## Q8 + DP4A 组合实验
+
+早期单独启用 Q8 激活量化没有积极效果。为了确认它是否需要和其他优化组合才会生效，后续重新实现了
+只针对最大瓶颈 down projection 的组合路径：
+
+- output-major reorder。
+- contiguous weights。
+- down WG2。
+- 一次 batched device-side BF16 -> Q8 activation quantization。
+- SYCL `dot_acc` DP4A。
+
+专用微基准严格模拟：
+
+```text
+active=8, N=2048, K=512, group_size=128
+```
+
+结果：
+
+```text
+BF16 WG2 down:          约 0.282-0.288 ms
+Q8 DP4A down（不量化）: 约 0.289 ms
+Q8 quant + DP4A down:   约 0.295-0.297 ms
+```
+
+数值误差：
+
+```text
+max_abs = 0.059437
+mean_abs = 0.010370
+relative L2 = 0.006408
+```
+
+Q8 路径慢约 3%-5%。原因是当前 output-major INT4 down 已主要受权重带宽限制，DP4A 减少的是算术，
+并没有减少主要权重读取量；动态量化、INT4 sign unpack 和额外 dependency 又增加了开销。
+
+因此实验代码保留用于研究，但默认关闭：
+
+```bash
+KT_SYCL_INT4_DOWN_Q8=0
+KT_SYCL_INT4_GATE_UP_Q8=0
+```
+
+不能仅凭“使用了 DP4A”判断会更快，必须把 activation quantization、kernel submit 和最终 wait 全部纳入
+端到端计时。
+
+## Shared USM 与 device USM 的最终 A/B
+
+纯 shared 权重配置：
+
+```bash
+KT_SYCL_INT4_DEVICE_WEIGHTS=0
+KT_SYCL_INT4_GATE_UP_DEVICE_WEIGHTS=0
+KT_SYCL_INT4_DOWN_DEVICE_WEIGHTS=0
+```
+
+fixed decode：
+
+```text
+54.2 ms
+53.5 ms
+平均 53.85 ms
+KT model timing @2000 calls = 53.170 ms
+```
+
+混合配置（gate/up shared、down device）：
+
+```text
+53.9 ms
+53.3 ms
+平均 53.60 ms
+KT model timing @2000 calls = 53.164 ms
+```
+
+客户端只差 `0.25 ms`，约 0.47%，模型内部长期累计值只差 `0.006 ms`，属于测试波动。
+
+分层日志还显示：
+
+```text
+纯 shared: avg_total=0.659ms, gate submit=0.058ms, down=0.582ms
+混合 USM: avg_total=0.668ms, gate submit=0.087ms, down=0.562ms
+```
+
+down device USM 本身更快，但会间接增加 gate/up 提交和调度时间，最终完全抵消。因此正式默认值继续使用
+纯 shared USM。
+
+## 当前推荐配置
+
+`perf-log/35b-build-sycl-int4.sh` 当前默认值已经对应最终组合。关键配置为：
 
 ```bash
 KT_SYCL_INT4_DECODE_MODE=per_gemm
 KT_SYCL_INT4_PER_GEMM_KERNEL=subgroup
 KT_SYCL_INT4_PER_GEMM_SUBGROUP=32
+
 KT_SYCL_INT4_GATE_UP_FUSE=1
 KT_SYCL_INT4_GATE_UP_BATCH=0
 KT_SYCL_INT4_GATE_UP_ASYNC=1
+KT_SYCL_INT4_GATE_UP_PACKED=1
+KT_SYCL_INT4_GATE_UP_PACKED_SUBGROUP=16
+
 KT_SYCL_INT4_DOWN_ASYNC=1
+KT_SYCL_INT4_DOWN_PACKED=1
+KT_SYCL_INT4_DOWN_PACKED_SUBGROUP=16
+KT_SYCL_INT4_DOWN_WG_ROWS=2
+
 KT_SYCL_INT4_GATE_UP_DOWN_PIPELINE=1
-KT_SYCL_INT4_GATE_UP_Q8=0
+KT_SYCL_INT4_WEIGHT_REORDER=1
+KT_SYCL_INT4_CONTIGUOUS_WEIGHTS=1
+KT_SYCL_INT4_SPECIALIZE=1
 KT_SYCL_INT4_FAST_SILU=1
+
+KT_SYCL_INT4_EXPERT_BATCH=0
+KT_SYCL_INT4_DOWN_OUTPUT_LANES=0
+KT_SYCL_INT4_GATE_UP_Q8=0
+KT_SYCL_INT4_DOWN_Q8=0
+
+KT_SYCL_INT4_DEVICE_WEIGHTS=0
+KT_SYCL_INT4_GATE_UP_DEVICE_WEIGHTS=0
+KT_SYCL_INT4_DOWN_DEVICE_WEIGHTS=0
+
 KT_SYCL_QUEUE_PROFILING=0
 KT_SYCL_QUEUE_IN_ORDER=0
+SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS=0
+SYCL_UR_USE_IMMEDIATE_COMMANDLISTS=0
 ```
 
-注意：当前主仓库把 `perf-log/` 识别为未跟踪的嵌套 Git 仓库。如果要提交 `35b-build-sycl-int4.sh`，需要在 `perf-log` 自己的仓库里提交，或者先明确调整仓库结构，避免在主仓库中误提交嵌入式 Git 仓库。
-
-### SGLang Qwen3 MoE timing
-
-为了定位 `TPOT` 中 MoE 专家计算之外的剩余耗时，新增了可选的 Python 侧分段计时：
-
-- `third_party/sglang/python/sglang/srt/models/qwen3_moe.py`
-  - `[KT layer timing]`：按层统计 `prepare_attn`、`attn`、`prepare_mlp`、`mlp`、`post`。
-  - `[KT model timing]`：统计 `Qwen3MoeForCausalLM.forward` 中的 model 与 logits。
-- `third_party/sglang/python/sglang/srt/model_executor/model_runner.py`
-  - `[KT runner timing]`：统计 `ModelRunner.forward` 的 raw model forward 与后处理 hook。
-  - `[KT sample timing]`：统计 logits preprocess 与 sampler。
-
-相关环境变量：
+启动服务：
 
 ```bash
-SGLANG_KT_HYBRID_TIMING=1          # 默认在 sycl-int4 启动脚本中开启
-SGLANG_KT_HYBRID_TIMING_EVERY=50   # 与 KT_MOE_DECODE_TRACE_EVERY 默认对齐
-SGLANG_KT_HYBRID_TIMING_ALL=0      # 默认只看 decode；设为 1 可包含 prefill/其他模式
-SGLANG_KT_HYBRID_TIMING_DEEP=0     # 设为 1 会插入 CUDA synchronize，诊断更准但会变慢
+bash perf-log/35b-build-sycl-int4.sh
 ```
 
-第一轮建议保持 `DEEP=0` 跑完整输出，先看 wall time 分布。如果 `[KT layer timing] avg_mlp` 与 `[MOE decode] avg_total` 接近，而 `avg_attn`、`avg_logits`、`[KT sample timing]` 或 `[KT runner timing] avg_post` 较大，就可以继续沿对应方向优化。只有在需要精确拆 CUDA 异步 kernel 归属时，再短跑 `SGLANG_KT_HYBRID_TIMING_DEEP=1`。
-
-## 实验过程与结论
-
-不同轮次的输入长度和输出长度并不完全一致，所以 TPOT 只能做近似比较；更稳定的判断依据是 `[MOE decode]` 的单层分项耗时。
-
-| 阶段 | 关键配置/改动 | 代表结果 | 结论 |
-| --- | --- | --- | --- |
-| 大 fused kernel | 单层融合 gate/up/down/merge | `avg_total ~80ms/layer`，device kernel 约 `1ms`，但 host 可见等待约 `60-80ms` | iGPU/OpenCL/Level-Zero 对该大 kernel 调度很差，不适合作为主路径 |
-| flat_i8 | 层内 flat 化 + int8 激活 | 约 `160ms/layer` | 变慢，放弃 |
-| per-gemm subgroup | 每个专家小 kernel，SG=8/16/32 | SG=32 最好，TPOT 约 `214.5ms` | 小 kernel 更适合当前 iGPU decode |
-| gate/up fused per expert | gate + up + activation 合为专家小 kernel | TPOT 约 `174.1ms`，`gate_up_act ~0.303ms/expert` | 明显有效，移除 CPU activation 和 down pack |
-| gate/up batch single kernel | 把 active experts 批到一个 kernel | `gate_up ~88ms/layer` | 大 batch kernel 触发调度问题，保持关闭 |
-| gate/up async | active experts 小 kernel 全部 submit 后等待 | TPOT 约 `161.3ms`，`gate_up ~1.76ms/layer` | 有效，减少串行等待 |
-| down async | down 小 kernel 全部 submit 后等待 | TPOT 约 `131.4ms`，`avg_down 2.322ms -> 0.717ms` | 本轮最大收益点 |
-| gate/up-down pipeline | down 依赖各自 gate/up event | TPOT 约 `129.4ms`，`avg_total ~2.275ms/layer` | 小幅收益，保留 |
-| gate/up q8 | 动态 int8 激活 + int4 权重 | TPOT 约 `138.4ms`，`avg_total ~2.736ms/layer` | 变慢，默认关闭 |
-| fast SiLU | `sycl::native::exp` | TPOT 约 `128.1ms`，`avg_total ~2.152ms/layer` | 小幅收益，默认开启 |
-
-最终较稳定的一组日志：
-
-```text
-Total: 79589ms | TTFT: 3108ms | TPOT: 128.1ms | In: 4 | Out: 601
-[MOE decode] layer=39 calls=600 avg_total=2.152ms avg_setup=0.051ms avg_pack=0.028ms avg_gate_up=0.099ms avg_activation=0.000ms avg_down_pack=0.000ms avg_down=1.972ms avg_merge=0.002ms avg_active=6.55 gate_up_fused=1.00
-```
-
-其中 pipeline 打开时，`avg_gate_up` 主要是 submit 时间，真实 gate/up 执行等待会被计入后续 `avg_down`。因此此模式下要重点比较 `avg_total` 和最终 TPOT，而不是单独看 `avg_gate_up`。
-
-## 当前推荐启动方式
-
-在 `perf-log/35b-build-sycl-int4.sh` 默认值已设置好的情况下，可直接运行：
+性能测试建议保持 `KT_TIMING=0`。需要分析分层耗时时再启用：
 
 ```bash
-cd /home/wy/Work/ktransformers/perf-log
-./35b-build-sycl-int4.sh
+KT_TIMING=1 bash perf-log/35b-build-sycl-int4.sh
 ```
 
-如果要显式指定当前推荐配置：
+## 构建与扩展同步
+
+使用 oneAPI 构建：
 
 ```bash
-KT_SYCL_INT4_GATE_UP_FUSE=1 \
-KT_SYCL_INT4_GATE_UP_BATCH=0 \
-KT_SYCL_INT4_GATE_UP_ASYNC=1 \
-KT_SYCL_INT4_DOWN_ASYNC=1 \
-KT_SYCL_INT4_GATE_UP_DOWN_PIPELINE=1 \
-KT_SYCL_INT4_GATE_UP_Q8=0 \
-KT_SYCL_INT4_FAST_SILU=1 \
-./35b-build-sycl-int4.sh
+source /opt/intel/oneapi/setvars.sh
+cmake --build \
+  kt-kernel/build/temp.linux-x86_64-cpython-311/kt_kernel.kt_kernel_ext_Release \
+  -j 8
 ```
 
-## 已验证不推荐的路径
+本地开发时要确认 Python 实际加载的是新构建的扩展。如果使用源码目录中的 `.so`，需要把构建产物同步到
+`kt-kernel/python/`，并做一次 import 检查，避免服务仍加载旧 kernel。
 
-- `KT_SYCL_INT4_GATE_UP_BATCH=1`
-  - 单个 batch kernel 变成约 `88ms/layer`，明显退化。
-- 大 fused decode kernel
-  - device kernel 时间不大，但排队/启动等待异常高。
-- `KT_SYCL_INT4_GATE_UP_Q8=1`
-  - 当前实现没有真正用到 DPAS/dp4a 矩阵指令，还额外引入动态量化和 scale 开销，实测变慢。
-- `KT_SYCL_QUEUE_PROFILING=1`
-  - 诊断有用，但可能显著放慢启动和推理，甚至触发 watchdog。
+## 日志索引
 
-## 当前瓶颈判断
+本轮主要日志位于 `perf-log/`：
 
-以 `TPOT ~128ms` 和 `avg_total ~2.15ms/layer` 粗算：
+- `q8-scalar-fixed.log`：早期 Q8 scalar。
+- `q8-dp4a.log`：早期 Q8 DP4A。
+- `down-nibble.log`、`down-packed.log`：down packed 对比。
+- `gate-up-packed.log`：gate/up packed。
+- `contiguous-only.log`：连续权重 slab。
+- `down-wg2.log`：down WG2。
+- `down-output-lanes.log`、`down-output-lanes4.log`：output-lane 实验。
+- `device-weights.log`、`hybrid-device-weights.log`：device 和混合 USM。
+- `shared-fixed-server.log`、`shared-fixed-client.log`：最终纯 shared 固定测试。
+- `hybrid-fixed-client.log`：混合 USM 固定测试。
 
-- MoE 专家计算约 `2.15ms * 40 = 86ms/token`。
-- 总 TPOT 约 `128ms/token`。
-- 剩余约 `40ms/token` 在 MoE 外部，包括 attention、shared experts/非专家层、SGLang 调度、Python/CUDA 侧同步等。
+## 调优经验总结
 
-因此，后续继续优化 SYCL MoE 内部仍有空间，但边际收益会变小。下一阶段先通过 `[KT layer timing]`、`[KT model timing]`、`[KT runner timing]` 和 `[KT sample timing]` 把 MoE 外部耗时拆出来，确认总 TPOT 的剩余瓶颈。
+1. 先优化内存布局，再优化算术指令。output-major reorder 的收益远大于单独 Q8/DP4A。
+2. 微基准必须覆盖完整依赖链。只测 DP4A kernel 而不测量化会得出错误结论。
+3. 对小于 2% 的变化必须固定 token 数，并同时看模型内部累计计时。
+4. iGPU 上更少的 kernel 不一定更快。单个 active-expert batch kernel 可能失去权重局部性并触发调度退化。
+5. 单阶段变快不代表端到端变快。down device USM 的收益被 gate/up 的退化抵消。
+6. 保留实验开关但默认关闭失败路径，便于后续在不同 iGPU、驱动和 oneAPI 版本上重新验证。
 
-## 后续优化方向
-
-1. 分离 MoE 外部耗时
-   - 打开 `SGLANG_KT_HYBRID_TIMING=1`，对齐 `[MOE decode]` 与 `[KT * timing]` 日志。
-   - 判断 `~40ms/token` 主要来自哪里。
-
-2. 更深入的 iGPU dot 路径
-   - 当前 q8 路径只是普通 int 累加，没有真正利用 DPAS/dp4a。
-   - 如果继续做 q8/int4，需要研究 Intel SYCL `joint_matrix`/DPAS 或 OpenCL Intel subgroup 扩展。
-
-3. down 输出合并迁移到 GPU
-   - 当前 down 后仍然回到 CPU 做 router weighted merge。
-   - 如果能在 GPU 上完成 down + weighted sum，可能减少回拷和 CPU merge，但要避免重新落入大 fused kernel 调度陷阱。
-
-4. 专家权重布局
-   - 当前权重布局沿用 GPTQ `[K/8, N]`。
-   - 小 kernel 可能受内存访问模式限制，后续可考虑 per-expert 预重排，但需要权衡加载时间和内存占用。
-
-5. 设备后端选择
-   - `opencl:gpu` 与 `level_zero:gpu` 需要持续 A/B。
-   - 本轮中 OpenCL 路径曾表现更稳定；Level-Zero immediate command list 对旧 fused 路径有小幅收益，但不是根本解。
-
-## 提交建议
-
-主仓库建议提交内容：
-
-- `kt-kernel/operators/avx2/moe_base.hpp`
-- `kt-kernel/operators/sycl/gptq_int4_sycl-moe.hpp`
-- `doc/zh/SYCL_GPTQ_INT4_iGPU_tuning_zh.md`
-- `doc/SUMMARY.md`
-
-`perf-log/35b-build-sycl-int4.sh` 位于嵌套 Git 仓库 `perf-log/`，建议单独在该目录提交：
-
-```bash
-cd /home/wy/Work/ktransformers/perf-log
-git status
-git add 35b-build-sycl-int4.sh
-git commit -m "Add SYCL INT4 iGPU launch defaults"
-```
-
-主仓库可参考提交信息：
-
-```bash
-git add kt-kernel/operators/avx2/moe_base.hpp \
-        kt-kernel/operators/sycl/gptq_int4_sycl-moe.hpp \
-        doc/zh/SYCL_GPTQ_INT4_iGPU_tuning_zh.md \
-        doc/SUMMARY.md
-git commit -m "Add SYCL GPTQ INT4 iGPU decode tuning path"
-```
+当前约一半 decode 时间已经不在 SYCL MoE 内部：`0.659 ms/layer * 40` 约为 `26.4 ms/token`，
+而模型内部 decode 总计约 `53.2 ms/token`。如果未来继续优化整体性能，应优先重新拆解 attention、其他层和
+框架调度开销，而不是继续假设瓶颈全部位于专家 GEMV。

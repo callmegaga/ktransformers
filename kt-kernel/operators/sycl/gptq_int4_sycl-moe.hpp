@@ -17,6 +17,7 @@
 #define CPUINFER_OPERATOR_SYCL_GPTQ_INT4_MOE_H
 
 #include <sycl/sycl.hpp>
+#include <sycl/ext/oneapi/dot_product.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -62,9 +63,19 @@ inline bool env_eq(const char* name, const char* expected) {
 inline bool queue_profiling_enabled() { return env_flag("KT_SYCL_QUEUE_PROFILING", false); }
 inline bool queue_in_order_enabled() { return env_flag("KT_SYCL_QUEUE_IN_ORDER", false); }
 inline bool device_weights_enabled() { return env_flag("KT_SYCL_INT4_DEVICE_WEIGHTS", false); }
+inline bool gate_up_device_weights_enabled() {
+  return env_flag("KT_SYCL_INT4_GATE_UP_DEVICE_WEIGHTS", device_weights_enabled());
+}
+inline bool down_device_weights_enabled() {
+  return env_flag("KT_SYCL_INT4_DOWN_DEVICE_WEIGHTS", device_weights_enabled());
+}
+inline bool any_device_weights_enabled() {
+  return gate_up_device_weights_enabled() || down_device_weights_enabled();
+}
 inline bool device_scratch_enabled() { return env_flag("KT_SYCL_INT4_DEVICE_SCRATCH", false); }
 inline bool fast_silu_enabled() { return env_flag("KT_SYCL_INT4_FAST_SILU", false); }
 inline bool weight_reorder_enabled() { return env_flag("KT_SYCL_INT4_WEIGHT_REORDER", false); }
+inline bool contiguous_weights_enabled() { return env_flag("KT_SYCL_INT4_CONTIGUOUS_WEIGHTS", false); }
 inline bool pre_kernel_ping_enabled() { return env_flag("KT_SYCL_INT4_PRE_KERNEL_PING", false); }
 inline bool shape_ping_enabled() { return env_flag("KT_SYCL_INT4_SHAPE_PING", false); }
 inline bool weight_ping_enabled() { return env_flag("KT_SYCL_INT4_WEIGHT_PING", false); }
@@ -199,6 +210,15 @@ static inline void quantize_bf16_i8_groups(const uint16_t* src, int len, int gro
   }
 }
 
+static inline int32_t unpack_i4x4_to_i8x4(uint32_t packed) {
+  uint32_t x = packed & 0xffffu;
+  x = (x | (x << 8)) & 0x00ff00ffu;
+  x = (x | (x << 4)) & 0x0f0f0f0fu;
+  const uint32_t neg = (~x) & 0x08080808u;
+  x = (x & 0x07070707u) | neg | (neg << 1) | (neg << 2) | (neg << 3) | (neg << 4);
+  return sycl::bit_cast<int32_t>(x);
+}
+
 // Per-instance device scratch for the fused decode path. Heap-allocated and stashed in
 // AVX2_MOE_BASE::fused_scratch_ (see note there: Derived may not add data members).
 struct FusedScratch {
@@ -219,6 +239,19 @@ struct FusedScratch {
   uint32_t *stage_gq = nullptr, *stage_uq = nullptr, *stage_dq = nullptr; // active weights in device USM
   float *stage_gs = nullptr, *stage_us = nullptr, *stage_ds = nullptr;
   int stage_cap = 0;
+  uint32_t *contig_gq = nullptr, *contig_uq = nullptr, *contig_dq = nullptr;
+  float *contig_gs = nullptr, *contig_us = nullptr, *contig_ds = nullptr;
+  size_t contig_gu_qw_stride = 0, contig_gu_sc_stride = 0;
+  size_t contig_d_qw_stride = 0, contig_d_sc_stride = 0;
+  bool contiguous_weights_ready = false;
+  int32_t* contiguous_expert_ids = nullptr;
+  uint16_t* contiguous_act = nullptr;
+  float* contiguous_down_out = nullptr;
+  int contiguous_batch_cap = 0;
+  uint16_t** down_q8_inputs = nullptr;
+  int8_t* down_q8_xq = nullptr;
+  float* down_q8_xs = nullptr;
+  int down_q8_cap = 0;
   uint32_t *cache_gq = nullptr, *cache_uq = nullptr, *cache_dq = nullptr; // reusable device weight cache
   float *cache_gs = nullptr, *cache_us = nullptr, *cache_ds = nullptr;
   int cache_cap = 0;
@@ -229,7 +262,12 @@ struct FusedScratch {
   uint16_t **gu_a = nullptr, **gu_out = nullptr; // batched gate+up activation pointer tables
   uint32_t **gu_gq = nullptr, **gu_uq = nullptr;
   float **gu_gs = nullptr, **gu_us = nullptr;
+  uint32_t **gu_dq = nullptr;
+  float **gu_ds = nullptr, **gu_down_out = nullptr;
   int gu_cap = 0;
+  sycl::event expert_batch_gate_up_event;
+  int expert_batch_active = 0;
+  bool expert_batch_pending = false;
   std::vector<sycl::event> gate_up_pipeline_events;
   std::vector<int> gate_up_pipeline_experts;
   int gate_up_pipeline_active = 0;
@@ -264,13 +302,15 @@ struct GemmKernelSYCLGPTQInt4 {
       const auto dev = q.get_device();
       if (!dev.get_info<sycl::info::device::usm_shared_allocations>())
         throw std::runtime_error("SYCL GPTQ-Int4 MoE requires USM shared allocation support.");
-      if (device_weights_enabled() && !dev.get_info<sycl::info::device::usm_device_allocations>())
+      if (any_device_weights_enabled() && !dev.get_info<sycl::info::device::usm_device_allocations>())
         throw std::runtime_error("SYCL GPTQ-Int4 device-weight mode requires USM device allocation support.");
       std::printf("Created SYCL_GPTQ_INT4_MOE on device: %s "
-                  "(queue_profiling=%d queue_in_order=%d device_weights=%d weight_reorder=%d)\n",
+                  "(queue_profiling=%d queue_in_order=%d gate_up_device_weights=%d "
+                  "down_device_weights=%d weight_reorder=%d contiguous_weights=%d)\n",
                   dev.get_info<sycl::info::device::name>().c_str(), queue_profiling_enabled() ? 1 : 0,
-                  queue_in_order_enabled() ? 1 : 0, device_weights_enabled() ? 1 : 0,
-                  weight_reorder_enabled() ? 1 : 0);
+                  queue_in_order_enabled() ? 1 : 0, gate_up_device_weights_enabled() ? 1 : 0,
+                  down_device_weights_enabled() ? 1 : 0, weight_reorder_enabled() ? 1 : 0,
+                  contiguous_weights_enabled() ? 1 : 0);
     });
   }
 
@@ -312,6 +352,7 @@ struct GemmKernelSYCLGPTQInt4 {
     int n = 0, k = 0, group_size = 128, num_groups = 0, k_packed = 0;
     bool device_storage = false;
     bool output_major = false;
+    bool owns_storage = true;
     BufferB() = default;
     BufferB(size_t n_, size_t k_, int gs, void*) : n((int)n_), k((int)k_), group_size(gs),
                                                    device_storage(device_weights_enabled()),
@@ -322,10 +363,24 @@ struct GemmKernelSYCLGPTQInt4 {
     }
     BufferB(const BufferB&) = delete;
     BufferB& operator=(const BufferB&) = delete;
-    ~BufferB() { usm_free(qw); usm_free(scales); }
+    ~BufferB() {
+      if (owns_storage) {
+        usm_free(qw);
+        usm_free(scales);
+      }
+    }
     static size_t required_size(size_t, size_t, int) { return 1; }
     size_t qweight_bytes() const { return (size_t)k_packed * n * sizeof(uint32_t); }
     size_t scales_bytes() const { return (size_t)num_groups * n * sizeof(float); }
+    void bind_external(uint32_t* qw_ptr, float* scales_ptr, bool take_ownership) {
+      if (owns_storage) {
+        usm_free(qw);
+        usm_free(scales);
+      }
+      qw = qw_ptr;
+      scales = scales_ptr;
+      owns_storage = take_ownership;
+    }
     void ensure() {
       if (device_storage) {
         if (!qw) qw = usm_alloc_device<uint32_t>((size_t)k_packed * n, "int4 BufferB qweight");
@@ -541,6 +596,208 @@ static inline sycl::event gemm_gptq_int4_sycl_subgroup_packed_submit(
   });
 }
 
+// Output-major weights make adjacent output rows contiguous. Map each output to
+// a small, contiguous lane group so one subgroup advances through several output
+// rows in lockstep. This reduces K-lane reduction work while retaining enough
+// parallelism for several asynchronously submitted expert kernels.
+template <int SG, int LANES_PER_OUTPUT = 1>
+static inline sycl::event gemm_gptq_int4_sycl_subgroup_output_lanes_submit(
+    int m, int n, int k, GemmKernelSYCLGPTQInt4::BufferA& a, GemmKernelSYCLGPTQInt4::BufferB& b,
+    GemmKernelSYCLGPTQInt4::BufferC& c, int ith, int nth, const sycl::event* dependency = nullptr) {
+  static_assert(LANES_PER_OUTPUT > 0 && LANES_PER_OUTPUT <= SG && (SG % LANES_PER_OUTPUT) == 0);
+  if (m <= 0 || n <= 0 || k <= 0) return sycl::event{};
+  auto [ns, ne] = avx2::split_range(n, ith, nth);
+  if (ns >= ne) return sycl::event{};
+  auto& q = queue();
+  const int N = b.n, gs = b.group_size, numg = b.num_groups, Kp = b.k_packed;
+  const bool output_major = b.output_major;
+  const int packed_per_group = gs / 8;
+  uint16_t* a_data = a.data;
+  uint32_t* qw = b.qw;
+  float* sc = b.scales;
+  float* c_data = c.data;
+  const size_t a_ld = a.k, c_ld = c.n;
+  const int nlen = ne - ns;
+  const size_t output_rows = (size_t)m * (size_t)nlen;
+  constexpr int outputs_per_subgroup = SG / LANES_PER_OUTPUT;
+  const size_t work_groups = (output_rows + (size_t)outputs_per_subgroup - 1) /
+                             (size_t)outputs_per_subgroup;
+  return q.submit([&](sycl::handler& h) {
+    if (dependency != nullptr) h.depends_on(*dependency);
+    h.parallel_for(sycl::nd_range<1>(work_groups * (size_t)SG, (size_t)SG), [=](sycl::nd_item<1> it)
+                   [[sycl::reqd_sub_group_size(SG)]] {
+      const auto subgroup = it.get_sub_group();
+      const int lane = (int)subgroup.get_local_linear_id();
+      const int output_lane = lane / LANES_PER_OUTPUT;
+      const int k_lane = lane - output_lane * LANES_PER_OUTPUT;
+      const size_t linear_row = it.get_group(0) * (size_t)outputs_per_subgroup + (size_t)output_lane;
+      const bool valid = linear_row < output_rows;
+      const int mi = valid ? (int)(linear_row / (size_t)nlen) : 0;
+      const int ni = valid ? ns + (int)(linear_row - (size_t)mi * (size_t)nlen) : ns;
+      const uint16_t* arow = a_data + (size_t)mi * a_ld;
+      float acc = 0.f;
+      for (int g = 0; g < numg; ++g) {
+        float partial = 0.f;
+        const int kp_base = g * packed_per_group;
+        for (int kpi = k_lane; kpi < packed_per_group; kpi += LANES_PER_OUTPUT) {
+          const int kp = kp_base + kpi;
+          const uint32_t packed = valid ? qw[qweight_offset(output_major, kp, ni, Kp, N)] : 0;
+          const uint16_t* xb = arow + (size_t)kp * 8;
+#pragma unroll
+          for (int bb = 0; bb < 8; ++bb) {
+            const int w = (int)((packed >> (bb * 4)) & 0xFu) - 8;
+            if (valid) partial += bf16_to_fp32(xb[bb]) * (float)w;
+          }
+        }
+        for (int mask = LANES_PER_OUTPUT / 2; mask > 0; mask >>= 1) {
+          partial += sycl::select_from_group(subgroup, partial, lane ^ mask);
+        }
+        if (valid && k_lane == 0) {
+          acc += partial * sc[weight_scale_offset(output_major, g, ni, numg, N)];
+        }
+      }
+      if (valid && k_lane == 0) c_data[(size_t)mi * c_ld + ni] = acc;
+    });
+  });
+}
+
+// Reordered llama.cpp MMVQ kernels place multiple subgroups in one work-group and
+// map one output row to each subgroup. Keep the same packed dot-product, but reduce
+// the number of tiny work-groups and let adjacent output rows share activation cache.
+template <int SG, int ROWS_PER_WG>
+static inline sycl::event gemm_gptq_int4_sycl_subgroup_packed_tiled_submit(
+    int m, int n, int k, GemmKernelSYCLGPTQInt4::BufferA& a, GemmKernelSYCLGPTQInt4::BufferB& b,
+    GemmKernelSYCLGPTQInt4::BufferC& c, int ith, int nth, const sycl::event* dependency = nullptr) {
+  static_assert(ROWS_PER_WG > 1);
+  if (m <= 0 || n <= 0 || k <= 0) return sycl::event{};
+  auto [ns, ne] = avx2::split_range(n, ith, nth);
+  if (ns >= ne) return sycl::event{};
+  auto& q = queue();
+  const int N = b.n, gs = b.group_size, numg = b.num_groups, Kp = b.k_packed;
+  const bool output_major = b.output_major;
+  const int packed_per_group = gs / 8;
+  uint16_t* a_data = a.data;
+  uint32_t* qw = b.qw;
+  float* sc = b.scales;
+  float* c_data = c.data;
+  const size_t a_ld = a.k, c_ld = c.n;
+  const int nlen = ne - ns;
+  const size_t output_rows = (size_t)m * (size_t)nlen;
+  const size_t work_groups = (output_rows + ROWS_PER_WG - 1) / ROWS_PER_WG;
+  constexpr size_t local_size = (size_t)SG * ROWS_PER_WG;
+  return q.submit([&](sycl::handler& h) {
+    if (dependency != nullptr) h.depends_on(*dependency);
+    h.parallel_for(sycl::nd_range<1>(work_groups * local_size, local_size), [=](sycl::nd_item<1> it)
+                   [[sycl::reqd_sub_group_size(SG)]] {
+      const auto subgroup = it.get_sub_group();
+      const int row_in_wg = (int)subgroup.get_group_linear_id();
+      const int lane = (int)subgroup.get_local_linear_id();
+      const size_t linear_row = it.get_group(0) * (size_t)ROWS_PER_WG + (size_t)row_in_wg;
+      if (linear_row >= output_rows) return;
+      const int mi = (int)(linear_row / (size_t)nlen);
+      const int ni = ns + (int)(linear_row - (size_t)mi * (size_t)nlen);
+      const uint16_t* arow = a_data + (size_t)mi * a_ld;
+      float acc = 0.f;
+      for (int g = 0; g < numg; ++g) {
+        float partial = 0.f;
+        const int kp_base = g * packed_per_group;
+        for (int kpi = lane; kpi < packed_per_group; kpi += SG) {
+          const int kp = kp_base + kpi;
+          const uint32_t packed = qw[qweight_offset(output_major, kp, ni, Kp, N)];
+          const uint16_t* xb = arow + (size_t)kp * 8;
+#pragma unroll
+          for (int bb = 0; bb < 8; ++bb) {
+            const int w = (int)((packed >> (bb * 4)) & 0xFu) - 8;
+            partial += bf16_to_fp32(xb[bb]) * (float)w;
+          }
+        }
+        const float group_sum = sycl::reduce_over_group(subgroup, partial, sycl::plus<float>());
+        if (lane == 0) acc += group_sum * sc[weight_scale_offset(output_major, g, ni, numg, N)];
+      }
+      if (lane == 0) c_data[(size_t)mi * c_ld + ni] = acc;
+    });
+  });
+}
+
+static inline sycl::event quantize_bf16_i8_groups_batched_submit(
+    int active, int k, int group_size, uint16_t** input_ptrs, int8_t* xq, float* xs,
+    const std::vector<sycl::event>* dependencies = nullptr) {
+  if (active <= 0 || k <= 0 || group_size <= 0) return sycl::event{};
+  auto& q = queue();
+  const int num_groups = k / group_size;
+  constexpr int WG = 128;
+  return q.submit([&](sycl::handler& h) {
+    if (dependencies != nullptr && !dependencies->empty()) h.depends_on(*dependencies);
+    h.parallel_for(sycl::nd_range<1>((size_t)active * num_groups * WG, WG), [=](sycl::nd_item<1> it) {
+      const int group_id = (int)it.get_group(0);
+      const int task = group_id / num_groups;
+      const int g = group_id - task * num_groups;
+      const int lane = (int)it.get_local_id(0);
+      const uint16_t* src = input_ptrs[task] + (size_t)g * group_size;
+      float amax = 0.f;
+      for (int t = lane; t < group_size; t += WG) {
+        amax = sycl::fmax(amax, sycl::fabs(bf16_to_fp32(src[t])));
+      }
+      amax = sycl::reduce_over_group(it.get_group(), amax, sycl::maximum<float>());
+      const float scale = amax > 0.f ? amax / 127.f : 0.f;
+      if (lane == 0) xs[(size_t)task * num_groups + g] = scale;
+      const float inv = scale > 0.f ? 1.f / scale : 0.f;
+      for (int t = lane; t < group_size; t += WG) {
+        int value = (int)sycl::rint(bf16_to_fp32(src[t]) * inv);
+        value = sycl::max(-127, sycl::min(127, value));
+        xq[(size_t)task * k + (size_t)g * group_size + t] = (int8_t)value;
+      }
+    });
+  });
+}
+
+template <int SG, int ROWS_PER_WG>
+static inline sycl::event gemm_gptq_int4_sycl_subgroup_q8_dp4a_tiled_submit(
+    int n, int k, const int8_t* xq, const float* xs, GemmKernelSYCLGPTQInt4::BufferB& b,
+    GemmKernelSYCLGPTQInt4::BufferC& c, const sycl::event* dependency = nullptr) {
+  static_assert(ROWS_PER_WG > 0);
+  if (n <= 0 || k <= 0) return sycl::event{};
+  auto& q = queue();
+  const int N = b.n, gs = b.group_size, numg = b.num_groups, Kp = b.k_packed;
+  const bool output_major = b.output_major;
+  const int packed_per_group = gs / 8;
+  uint32_t* qw = b.qw;
+  float* sc = b.scales;
+  float* c_data = c.data;
+  constexpr size_t local_size = (size_t)SG * ROWS_PER_WG;
+  const size_t work_groups = ((size_t)n + ROWS_PER_WG - 1) / ROWS_PER_WG;
+  return q.submit([&](sycl::handler& h) {
+    if (dependency != nullptr) h.depends_on(*dependency);
+    h.parallel_for(sycl::nd_range<1>(work_groups * local_size, local_size), [=](sycl::nd_item<1> it)
+                   [[sycl::reqd_sub_group_size(SG)]] {
+      const auto subgroup = it.get_sub_group();
+      const int row_in_wg = (int)subgroup.get_group_linear_id();
+      const int lane = (int)subgroup.get_local_linear_id();
+      const int ni = (int)it.get_group(0) * ROWS_PER_WG + row_in_wg;
+      if (ni >= n) return;
+      float acc = 0.f;
+      for (int g = 0; g < numg; ++g) {
+        int partial = 0;
+        const int kp_base = g * packed_per_group;
+        for (int kpi = lane; kpi < packed_per_group; kpi += SG) {
+          const int kp = kp_base + kpi;
+          const uint32_t packed = qw[qweight_offset(output_major, kp, ni, Kp, N)];
+          const int8_t* xb = xq + (size_t)kp * 8;
+          const int32_t x0 = *reinterpret_cast<const int32_t*>(xb);
+          const int32_t x1 = *reinterpret_cast<const int32_t*>(xb + 4);
+          partial = sycl::ext::oneapi::dot_acc(x0, unpack_i4x4_to_i8x4(packed), partial);
+          partial = sycl::ext::oneapi::dot_acc(x1, unpack_i4x4_to_i8x4(packed >> 16), partial);
+        }
+        const int group_sum = sycl::reduce_over_group(subgroup, partial, sycl::plus<int>());
+        if (lane == 0) {
+          acc += (float)group_sum * xs[g] * sc[weight_scale_offset(output_major, g, ni, numg, N)];
+        }
+      }
+      if (lane == 0) c_data[ni] = acc;
+    });
+  });
+}
+
 template <int SG>
 static inline void gemm_gptq_int4_sycl_subgroup(int m, int n, int k, GemmKernelSYCLGPTQInt4::BufferA& a,
                                                 GemmKernelSYCLGPTQInt4::BufferB& b,
@@ -594,6 +851,82 @@ static inline sycl::event gemm_gptq_int4_sycl_subgroup_packed_submit_dispatch(
     case 16:
     default:
       return gemm_gptq_int4_sycl_subgroup_packed_submit<16>(m, n, k, a, b, c, ith, nth, dependency);
+  }
+}
+
+static inline sycl::event gemm_gptq_int4_sycl_subgroup_output_lanes_submit_dispatch(
+    int sg, int lanes_per_output, int m, int n, int k, GemmKernelSYCLGPTQInt4::BufferA& a,
+    GemmKernelSYCLGPTQInt4::BufferB& b, GemmKernelSYCLGPTQInt4::BufferC& c, int ith, int nth,
+    const sycl::event* dependency = nullptr) {
+  switch (sg) {
+    case 8:
+      return gemm_gptq_int4_sycl_subgroup_output_lanes_submit<8>(m, n, k, a, b, c, ith, nth, dependency);
+    case 32:
+      return gemm_gptq_int4_sycl_subgroup_output_lanes_submit<32>(m, n, k, a, b, c, ith, nth, dependency);
+    case 16:
+    default:
+      switch (lanes_per_output) {
+        case 2:
+          return gemm_gptq_int4_sycl_subgroup_output_lanes_submit<16, 2>(m, n, k, a, b, c, ith, nth,
+                                                                         dependency);
+        case 4:
+          return gemm_gptq_int4_sycl_subgroup_output_lanes_submit<16, 4>(m, n, k, a, b, c, ith, nth,
+                                                                         dependency);
+        case 8:
+          return gemm_gptq_int4_sycl_subgroup_output_lanes_submit<16, 8>(m, n, k, a, b, c, ith, nth,
+                                                                         dependency);
+        case 16:
+          return gemm_gptq_int4_sycl_subgroup_output_lanes_submit<16, 16>(m, n, k, a, b, c, ith, nth,
+                                                                          dependency);
+        case 1:
+        default:
+          return gemm_gptq_int4_sycl_subgroup_output_lanes_submit<16, 1>(m, n, k, a, b, c, ith, nth,
+                                                                         dependency);
+      }
+  }
+}
+
+static inline sycl::event gemm_gptq_int4_sycl_subgroup_packed_tiled_submit_dispatch(
+    int sg, int rows_per_wg, int m, int n, int k, GemmKernelSYCLGPTQInt4::BufferA& a,
+    GemmKernelSYCLGPTQInt4::BufferB& b, GemmKernelSYCLGPTQInt4::BufferC& c, int ith, int nth,
+    const sycl::event* dependency = nullptr) {
+  if (sg != 16 || rows_per_wg <= 1) {
+    return gemm_gptq_int4_sycl_subgroup_packed_submit_dispatch(sg, m, n, k, a, b, c, ith, nth, dependency);
+  }
+  switch (rows_per_wg) {
+    case 2:
+      return gemm_gptq_int4_sycl_subgroup_packed_tiled_submit<16, 2>(m, n, k, a, b, c, ith, nth, dependency);
+    case 4:
+      return gemm_gptq_int4_sycl_subgroup_packed_tiled_submit<16, 4>(m, n, k, a, b, c, ith, nth, dependency);
+    case 8:
+      return gemm_gptq_int4_sycl_subgroup_packed_tiled_submit<16, 8>(m, n, k, a, b, c, ith, nth, dependency);
+    case 16:
+      return gemm_gptq_int4_sycl_subgroup_packed_tiled_submit<16, 16>(m, n, k, a, b, c, ith, nth, dependency);
+    case 32:
+      return gemm_gptq_int4_sycl_subgroup_packed_tiled_submit<16, 32>(m, n, k, a, b, c, ith, nth, dependency);
+    default:
+      return gemm_gptq_int4_sycl_subgroup_packed_submit_dispatch(sg, m, n, k, a, b, c, ith, nth, dependency);
+  }
+}
+
+static inline sycl::event gemm_gptq_int4_sycl_subgroup_q8_dp4a_tiled_submit_dispatch(
+    int sg, int rows_per_wg, int n, int k, const int8_t* xq, const float* xs,
+    GemmKernelSYCLGPTQInt4::BufferB& b, GemmKernelSYCLGPTQInt4::BufferC& c,
+    const sycl::event* dependency = nullptr) {
+  if (sg == 8) {
+    return gemm_gptq_int4_sycl_subgroup_q8_dp4a_tiled_submit<8, 2>(n, k, xq, xs, b, c, dependency);
+  }
+  if (sg == 32) {
+    return gemm_gptq_int4_sycl_subgroup_q8_dp4a_tiled_submit<32, 2>(n, k, xq, xs, b, c, dependency);
+  }
+  switch (rows_per_wg) {
+    case 4:
+      return gemm_gptq_int4_sycl_subgroup_q8_dp4a_tiled_submit<16, 4>(n, k, xq, xs, b, c, dependency);
+    case 8:
+      return gemm_gptq_int4_sycl_subgroup_q8_dp4a_tiled_submit<16, 8>(n, k, xq, xs, b, c, dependency);
+    case 2:
+    default:
+      return gemm_gptq_int4_sycl_subgroup_q8_dp4a_tiled_submit<16, 2>(n, k, xq, xs, b, c, dependency);
   }
 }
 
@@ -860,20 +1193,22 @@ static inline sycl::event gate_up_activation_gptq_int4_sycl_subgroup_q8_submit_d
   }
 }
 
-template <int SG>
-static inline void gate_up_activation_gptq_int4_sycl_subgroup_batched(
+template <int SG, bool PackedBlock = false>
+static inline sycl::event gate_up_activation_gptq_int4_sycl_subgroup_batched_submit(
     int active, int m, int n, int k, uint16_t** a_ptrs, uint32_t** gate_qw_ptrs, uint32_t** up_qw_ptrs,
     float** gate_sc_ptrs, float** up_sc_ptrs, uint16_t** out_ptrs, int group_size, float swiglu_limit,
-    float swiglu_alpha, bool fast_silu) {
-  if (active <= 0 || m <= 0 || n <= 0 || k <= 0) return;
+    float swiglu_alpha, bool fast_silu, const sycl::event* dependency = nullptr) {
+  if (active <= 0 || m <= 0 || n <= 0 || k <= 0) return sycl::event{};
   auto& q = queue();
   const int gs = group_size;
   const int numg = k / gs;
   const int Kp = k / 8;
+  const int packed_per_group = gs / 8;
   const bool output_major = weight_reorder_enabled();
   const size_t per_active = (size_t)m * (size_t)n;
   const size_t groups = (size_t)active * per_active;
-  q.submit([&](sycl::handler& h) {
+  return q.submit([&](sycl::handler& h) {
+     if (dependency != nullptr) h.depends_on(*dependency);
      h.parallel_for(sycl::nd_range<1>(groups * (size_t)SG, (size_t)SG), [=](sycl::nd_item<1> it)
                     [[sycl::reqd_sub_group_size(SG)]] {
        const size_t gid = it.get_group(0);
@@ -892,15 +1227,31 @@ static inline void gate_up_activation_gptq_int4_sycl_subgroup_batched(
        for (int g = 0; g < numg; ++g) {
          float gate_partial = 0.f;
          float up_partial = 0.f;
-         const int kbase = g * gs;
-         for (int t = lane; t < gs; t += SG) {
-           const int kk = kbase + t;
-           const int shift = (kk & 7) * 4;
-           const float xv = bf16_to_fp32(arow[kk]);
-           const uint32_t pg = gqw[qweight_offset(output_major, kk >> 3, ni, Kp, n)];
-           const uint32_t pu = uqw[qweight_offset(output_major, kk >> 3, ni, Kp, n)];
-           gate_partial += xv * (float)((int)((pg >> shift) & 0xFu) - 8);
-           up_partial += xv * (float)((int)((pu >> shift) & 0xFu) - 8);
+         if constexpr (PackedBlock) {
+           const int kp_base = g * packed_per_group;
+           for (int kpi = lane; kpi < packed_per_group; kpi += SG) {
+             const int kp = kp_base + kpi;
+             const uint32_t pg = gqw[qweight_offset(output_major, kp, ni, Kp, n)];
+             const uint32_t pu = uqw[qweight_offset(output_major, kp, ni, Kp, n)];
+             const uint16_t* xb = arow + (size_t)kp * 8;
+#pragma unroll
+             for (int bb = 0; bb < 8; ++bb) {
+               const float xv = bf16_to_fp32(xb[bb]);
+               gate_partial += xv * (float)((int)((pg >> (bb * 4)) & 0xFu) - 8);
+               up_partial += xv * (float)((int)((pu >> (bb * 4)) & 0xFu) - 8);
+             }
+           }
+         } else {
+           const int kbase = g * gs;
+           for (int t = lane; t < gs; t += SG) {
+             const int kk = kbase + t;
+             const int shift = (kk & 7) * 4;
+             const float xv = bf16_to_fp32(arow[kk]);
+             const uint32_t pg = gqw[qweight_offset(output_major, kk >> 3, ni, Kp, n)];
+             const uint32_t pu = uqw[qweight_offset(output_major, kk >> 3, ni, Kp, n)];
+             gate_partial += xv * (float)((int)((pg >> shift) & 0xFu) - 8);
+             up_partial += xv * (float)((int)((pu >> shift) & 0xFu) - 8);
+           }
          }
          const float gate_sum = sycl::reduce_over_group(it.get_sub_group(), gate_partial, sycl::plus<float>());
          const float up_sum = sycl::reduce_over_group(it.get_sub_group(), up_partial, sycl::plus<float>());
@@ -933,30 +1284,330 @@ static inline void gate_up_activation_gptq_int4_sycl_subgroup_batched(
          out_ptrs[aidx][(size_t)mi * (size_t)n + (size_t)ni] = fp32_to_bf16_device(act);
        }
      });
-   }).wait_and_throw();
+   });
 }
 
-static inline void gate_up_activation_gptq_int4_sycl_subgroup_batched_dispatch(
-    int sg, int active, int m, int n, int k, uint16_t** a_ptrs, uint32_t** gate_qw_ptrs, uint32_t** up_qw_ptrs,
+static inline sycl::event gate_up_activation_gptq_int4_sycl_subgroup_batched_submit_dispatch(
+    int sg, bool packed, int active, int m, int n, int k, uint16_t** a_ptrs, uint32_t** gate_qw_ptrs,
+    uint32_t** up_qw_ptrs,
     float** gate_sc_ptrs, float** up_sc_ptrs, uint16_t** out_ptrs, int group_size, float swiglu_limit,
-    float swiglu_alpha, bool fast_silu) {
+    float swiglu_alpha, bool fast_silu, const sycl::event* dependency = nullptr) {
   switch (sg) {
     case 8:
-      gate_up_activation_gptq_int4_sycl_subgroup_batched<8>(active, m, n, k, a_ptrs, gate_qw_ptrs, up_qw_ptrs,
-                                                            gate_sc_ptrs, up_sc_ptrs, out_ptrs, group_size,
-                                                            swiglu_limit, swiglu_alpha, fast_silu);
-      break;
+      return packed ? gate_up_activation_gptq_int4_sycl_subgroup_batched_submit<8, true>(
+                          active, m, n, k, a_ptrs, gate_qw_ptrs, up_qw_ptrs, gate_sc_ptrs, up_sc_ptrs, out_ptrs,
+                          group_size, swiglu_limit, swiglu_alpha, fast_silu, dependency)
+                    : gate_up_activation_gptq_int4_sycl_subgroup_batched_submit<8, false>(
+                          active, m, n, k, a_ptrs, gate_qw_ptrs, up_qw_ptrs, gate_sc_ptrs, up_sc_ptrs, out_ptrs,
+                          group_size, swiglu_limit, swiglu_alpha, fast_silu, dependency);
     case 32:
-      gate_up_activation_gptq_int4_sycl_subgroup_batched<32>(active, m, n, k, a_ptrs, gate_qw_ptrs, up_qw_ptrs,
-                                                             gate_sc_ptrs, up_sc_ptrs, out_ptrs, group_size,
-                                                             swiglu_limit, swiglu_alpha, fast_silu);
-      break;
+      return packed ? gate_up_activation_gptq_int4_sycl_subgroup_batched_submit<32, true>(
+                          active, m, n, k, a_ptrs, gate_qw_ptrs, up_qw_ptrs, gate_sc_ptrs, up_sc_ptrs, out_ptrs,
+                          group_size, swiglu_limit, swiglu_alpha, fast_silu, dependency)
+                    : gate_up_activation_gptq_int4_sycl_subgroup_batched_submit<32, false>(
+                          active, m, n, k, a_ptrs, gate_qw_ptrs, up_qw_ptrs, gate_sc_ptrs, up_sc_ptrs, out_ptrs,
+                          group_size, swiglu_limit, swiglu_alpha, fast_silu, dependency);
     case 16:
     default:
-      gate_up_activation_gptq_int4_sycl_subgroup_batched<16>(active, m, n, k, a_ptrs, gate_qw_ptrs, up_qw_ptrs,
-                                                             gate_sc_ptrs, up_sc_ptrs, out_ptrs, group_size,
-                                                             swiglu_limit, swiglu_alpha, fast_silu);
-      break;
+      return packed ? gate_up_activation_gptq_int4_sycl_subgroup_batched_submit<16, true>(
+                          active, m, n, k, a_ptrs, gate_qw_ptrs, up_qw_ptrs, gate_sc_ptrs, up_sc_ptrs, out_ptrs,
+                          group_size, swiglu_limit, swiglu_alpha, fast_silu, dependency)
+                    : gate_up_activation_gptq_int4_sycl_subgroup_batched_submit<16, false>(
+                          active, m, n, k, a_ptrs, gate_qw_ptrs, up_qw_ptrs, gate_sc_ptrs, up_sc_ptrs, out_ptrs,
+                          group_size, swiglu_limit, swiglu_alpha, fast_silu, dependency);
+  }
+}
+
+template <int SG, bool PackedBlock = false>
+static inline sycl::event gemm_gptq_int4_sycl_subgroup_batched_submit(
+    int active, int m, int n, int k, uint16_t** a_ptrs, uint32_t** qw_ptrs, float** sc_ptrs, float** out_ptrs,
+    int group_size, const sycl::event* dependency = nullptr) {
+  if (active <= 0 || m <= 0 || n <= 0 || k <= 0) return sycl::event{};
+  auto& q = queue();
+  const int gs = group_size;
+  const int numg = k / gs;
+  const int Kp = k / 8;
+  const int packed_per_group = gs / 8;
+  const bool output_major = weight_reorder_enabled();
+  const size_t per_active = (size_t)m * (size_t)n;
+  const size_t groups = (size_t)active * per_active;
+  return q.submit([&](sycl::handler& h) {
+    if (dependency != nullptr) h.depends_on(*dependency);
+    h.parallel_for(sycl::nd_range<1>(groups * (size_t)SG, (size_t)SG), [=](sycl::nd_item<1> it)
+                   [[sycl::reqd_sub_group_size(SG)]] {
+      const size_t gid = it.get_group(0);
+      const int lane = (int)it.get_local_id(0);
+      const int aidx = (int)(gid / per_active);
+      const size_t rem = gid - (size_t)aidx * per_active;
+      const int mi = (int)(rem / (size_t)n);
+      const int ni = (int)(rem - (size_t)mi * (size_t)n);
+      const uint16_t* arow = a_ptrs[aidx] + (size_t)mi * (size_t)k;
+      const uint32_t* qw = qw_ptrs[aidx];
+      const float* sc = sc_ptrs[aidx];
+      float acc = 0.f;
+      for (int g = 0; g < numg; ++g) {
+        float partial = 0.f;
+        if constexpr (PackedBlock) {
+          const int kp_base = g * packed_per_group;
+          for (int kpi = lane; kpi < packed_per_group; kpi += SG) {
+            const int kp = kp_base + kpi;
+            const uint32_t packed_w = qw[qweight_offset(output_major, kp, ni, Kp, n)];
+            const uint16_t* xb = arow + (size_t)kp * 8;
+#pragma unroll
+            for (int bb = 0; bb < 8; ++bb) {
+              const int w = (int)((packed_w >> (bb * 4)) & 0xFu) - 8;
+              partial += bf16_to_fp32(xb[bb]) * (float)w;
+            }
+          }
+        } else {
+          const int kbase = g * gs;
+          for (int t = lane; t < gs; t += SG) {
+            const int kk = kbase + t;
+            const uint32_t packed_w = qw[qweight_offset(output_major, kk >> 3, ni, Kp, n)];
+            const int w = (int)((packed_w >> ((kk & 7) * 4)) & 0xFu) - 8;
+            partial += bf16_to_fp32(arow[kk]) * (float)w;
+          }
+        }
+        const float group_sum = sycl::reduce_over_group(it.get_sub_group(), partial, sycl::plus<float>());
+        if (lane == 0) acc += group_sum * sc[weight_scale_offset(output_major, g, ni, numg, n)];
+      }
+      if (lane == 0) out_ptrs[aidx][(size_t)mi * (size_t)n + (size_t)ni] = acc;
+    });
+  });
+}
+
+static inline sycl::event gemm_gptq_int4_sycl_subgroup_batched_submit_dispatch(
+    int sg, bool packed, int active, int m, int n, int k, uint16_t** a_ptrs, uint32_t** qw_ptrs,
+    float** sc_ptrs, float** out_ptrs, int group_size, const sycl::event* dependency = nullptr) {
+  switch (sg) {
+    case 8:
+      return packed ? gemm_gptq_int4_sycl_subgroup_batched_submit<8, true>(
+                          active, m, n, k, a_ptrs, qw_ptrs, sc_ptrs, out_ptrs, group_size, dependency)
+                    : gemm_gptq_int4_sycl_subgroup_batched_submit<8, false>(
+                          active, m, n, k, a_ptrs, qw_ptrs, sc_ptrs, out_ptrs, group_size, dependency);
+    case 32:
+      return packed ? gemm_gptq_int4_sycl_subgroup_batched_submit<32, true>(
+                          active, m, n, k, a_ptrs, qw_ptrs, sc_ptrs, out_ptrs, group_size, dependency)
+                    : gemm_gptq_int4_sycl_subgroup_batched_submit<32, false>(
+                          active, m, n, k, a_ptrs, qw_ptrs, sc_ptrs, out_ptrs, group_size, dependency);
+    case 16:
+    default:
+      return packed ? gemm_gptq_int4_sycl_subgroup_batched_submit<16, true>(
+                          active, m, n, k, a_ptrs, qw_ptrs, sc_ptrs, out_ptrs, group_size, dependency)
+                    : gemm_gptq_int4_sycl_subgroup_batched_submit<16, false>(
+                          active, m, n, k, a_ptrs, qw_ptrs, sc_ptrs, out_ptrs, group_size, dependency);
+  }
+}
+
+// llama.cpp-style MoE mapping: expert is an ND-range dimension and weights are selected
+// from one contiguous slab with base + expert_id * stride. Decode shares one input row
+// across gate/up experts and keeps the intermediate/output rows contiguous by active slot.
+template <int SG, bool PackedBlock = false>
+static inline sycl::event gate_up_activation_gptq_int4_sycl_subgroup_contiguous_submit(
+    int active, int n, int k, const uint16_t* input, const int32_t* expert_ids,
+    const uint32_t* gate_qw_base, const uint32_t* up_qw_base, const float* gate_sc_base,
+    const float* up_sc_base, size_t qw_expert_stride, size_t sc_expert_stride, uint16_t* out,
+    int group_size, float swiglu_limit, float swiglu_alpha, bool fast_silu) {
+  if (active <= 0 || n <= 0 || k <= 0) return sycl::event{};
+  auto& q = queue();
+  const int gs = group_size;
+  const int numg = k / gs;
+  const int Kp = k / 8;
+  const int packed_per_group = gs / 8;
+  const bool output_major = weight_reorder_enabled();
+  const size_t groups = (size_t)active * (size_t)n;
+  return q.submit([&](sycl::handler& h) {
+    h.parallel_for(sycl::nd_range<1>(groups * (size_t)SG, (size_t)SG), [=](sycl::nd_item<1> it)
+                   [[sycl::reqd_sub_group_size(SG)]] {
+      const size_t gid = it.get_group(0);
+      const int lane = (int)it.get_local_id(0);
+      const int active_idx = (int)(gid / (size_t)n);
+      const int ni = (int)(gid - (size_t)active_idx * (size_t)n);
+      const int expert_idx = expert_ids[active_idx];
+      const uint32_t* gqw = gate_qw_base + (size_t)expert_idx * qw_expert_stride;
+      const uint32_t* uqw = up_qw_base + (size_t)expert_idx * qw_expert_stride;
+      const float* gsc = gate_sc_base + (size_t)expert_idx * sc_expert_stride;
+      const float* usc = up_sc_base + (size_t)expert_idx * sc_expert_stride;
+      float gate_acc = 0.f;
+      float up_acc = 0.f;
+      for (int g = 0; g < numg; ++g) {
+        float gate_partial = 0.f;
+        float up_partial = 0.f;
+        if constexpr (PackedBlock) {
+          const int kp_base = g * packed_per_group;
+          for (int kpi = lane; kpi < packed_per_group; kpi += SG) {
+            const int kp = kp_base + kpi;
+            const uint32_t pg = gqw[qweight_offset(output_major, kp, ni, Kp, n)];
+            const uint32_t pu = uqw[qweight_offset(output_major, kp, ni, Kp, n)];
+            const uint16_t* xb = input + (size_t)kp * 8;
+#pragma unroll
+            for (int bb = 0; bb < 8; ++bb) {
+              const float xv = bf16_to_fp32(xb[bb]);
+              gate_partial += xv * (float)((int)((pg >> (bb * 4)) & 0xFu) - 8);
+              up_partial += xv * (float)((int)((pu >> (bb * 4)) & 0xFu) - 8);
+            }
+          }
+        } else {
+          const int kbase = g * gs;
+          for (int t = lane; t < gs; t += SG) {
+            const int kk = kbase + t;
+            const int shift = (kk & 7) * 4;
+            const float xv = bf16_to_fp32(input[kk]);
+            const uint32_t pg = gqw[qweight_offset(output_major, kk >> 3, ni, Kp, n)];
+            const uint32_t pu = uqw[qweight_offset(output_major, kk >> 3, ni, Kp, n)];
+            gate_partial += xv * (float)((int)((pg >> shift) & 0xFu) - 8);
+            up_partial += xv * (float)((int)((pu >> shift) & 0xFu) - 8);
+          }
+        }
+        const float gate_sum = sycl::reduce_over_group(it.get_sub_group(), gate_partial, sycl::plus<float>());
+        const float up_sum = sycl::reduce_over_group(it.get_sub_group(), up_partial, sycl::plus<float>());
+        if (lane == 0) {
+          gate_acc += gate_sum * gsc[weight_scale_offset(output_major, g, ni, numg, n)];
+          up_acc += up_sum * usc[weight_scale_offset(output_major, g, ni, numg, n)];
+        }
+      }
+      if (lane == 0) {
+        float gv = gate_acc;
+        float uv = up_acc;
+        float act = 0.f;
+        if (swiglu_alpha > 0.f) {
+          if (swiglu_limit > 0.f) {
+            gv = sycl::fmin(sycl::fmax(gv, -swiglu_limit), swiglu_limit);
+            uv = sycl::fmin(sycl::fmax(uv, -swiglu_limit), swiglu_limit);
+          }
+          const float x = -gv * swiglu_alpha;
+          const float sig = fast_silu ? 1.f / (1.f + sycl::native::exp(x)) : 1.f / (1.f + sycl::exp(x));
+          act = gv * sig * (uv + 1.f);
+        } else {
+          if (swiglu_limit > 0.f) {
+            gv = sycl::fmin(gv, swiglu_limit);
+            uv = sycl::fmin(sycl::fmax(uv, -swiglu_limit), swiglu_limit);
+          }
+          const float x = -gv;
+          const float sig = fast_silu ? 1.f / (1.f + sycl::native::exp(x)) : 1.f / (1.f + sycl::exp(x));
+          act = gv * sig * uv;
+        }
+        out[(size_t)active_idx * (size_t)n + (size_t)ni] = fp32_to_bf16_device(act);
+      }
+    });
+  });
+}
+
+static inline sycl::event gate_up_activation_gptq_int4_sycl_subgroup_contiguous_submit_dispatch(
+    int sg, bool packed, int active, int n, int k, const uint16_t* input, const int32_t* expert_ids,
+    const uint32_t* gate_qw_base, const uint32_t* up_qw_base, const float* gate_sc_base,
+    const float* up_sc_base, size_t qw_expert_stride, size_t sc_expert_stride, uint16_t* out,
+    int group_size, float swiglu_limit, float swiglu_alpha, bool fast_silu) {
+  switch (sg) {
+    case 8:
+      return packed ? gate_up_activation_gptq_int4_sycl_subgroup_contiguous_submit<8, true>(
+                          active, n, k, input, expert_ids, gate_qw_base, up_qw_base, gate_sc_base, up_sc_base,
+                          qw_expert_stride, sc_expert_stride, out, group_size, swiglu_limit, swiglu_alpha, fast_silu)
+                    : gate_up_activation_gptq_int4_sycl_subgroup_contiguous_submit<8, false>(
+                          active, n, k, input, expert_ids, gate_qw_base, up_qw_base, gate_sc_base, up_sc_base,
+                          qw_expert_stride, sc_expert_stride, out, group_size, swiglu_limit, swiglu_alpha, fast_silu);
+    case 32:
+      return packed ? gate_up_activation_gptq_int4_sycl_subgroup_contiguous_submit<32, true>(
+                          active, n, k, input, expert_ids, gate_qw_base, up_qw_base, gate_sc_base, up_sc_base,
+                          qw_expert_stride, sc_expert_stride, out, group_size, swiglu_limit, swiglu_alpha, fast_silu)
+                    : gate_up_activation_gptq_int4_sycl_subgroup_contiguous_submit<32, false>(
+                          active, n, k, input, expert_ids, gate_qw_base, up_qw_base, gate_sc_base, up_sc_base,
+                          qw_expert_stride, sc_expert_stride, out, group_size, swiglu_limit, swiglu_alpha, fast_silu);
+    case 16:
+    default:
+      return packed ? gate_up_activation_gptq_int4_sycl_subgroup_contiguous_submit<16, true>(
+                          active, n, k, input, expert_ids, gate_qw_base, up_qw_base, gate_sc_base, up_sc_base,
+                          qw_expert_stride, sc_expert_stride, out, group_size, swiglu_limit, swiglu_alpha, fast_silu)
+                    : gate_up_activation_gptq_int4_sycl_subgroup_contiguous_submit<16, false>(
+                          active, n, k, input, expert_ids, gate_qw_base, up_qw_base, gate_sc_base, up_sc_base,
+                          qw_expert_stride, sc_expert_stride, out, group_size, swiglu_limit, swiglu_alpha, fast_silu);
+  }
+}
+
+template <int SG, bool PackedBlock = false>
+static inline sycl::event gemm_gptq_int4_sycl_subgroup_contiguous_submit(
+    int active, int n, int k, const uint16_t* input, const int32_t* expert_ids, const uint32_t* qw_base,
+    const float* sc_base, size_t qw_expert_stride, size_t sc_expert_stride, float* out, int group_size,
+    const sycl::event* dependency = nullptr) {
+  if (active <= 0 || n <= 0 || k <= 0) return sycl::event{};
+  auto& q = queue();
+  const int gs = group_size;
+  const int numg = k / gs;
+  const int Kp = k / 8;
+  const int packed_per_group = gs / 8;
+  const bool output_major = weight_reorder_enabled();
+  const size_t groups = (size_t)active * (size_t)n;
+  return q.submit([&](sycl::handler& h) {
+    if (dependency != nullptr) h.depends_on(*dependency);
+    h.parallel_for(sycl::nd_range<1>(groups * (size_t)SG, (size_t)SG), [=](sycl::nd_item<1> it)
+                   [[sycl::reqd_sub_group_size(SG)]] {
+      const size_t gid = it.get_group(0);
+      const int lane = (int)it.get_local_id(0);
+      const int active_idx = (int)(gid / (size_t)n);
+      const int ni = (int)(gid - (size_t)active_idx * (size_t)n);
+      const int expert_idx = expert_ids[active_idx];
+      const uint16_t* arow = input + (size_t)active_idx * (size_t)k;
+      const uint32_t* qw = qw_base + (size_t)expert_idx * qw_expert_stride;
+      const float* sc = sc_base + (size_t)expert_idx * sc_expert_stride;
+      float acc = 0.f;
+      for (int g = 0; g < numg; ++g) {
+        float partial = 0.f;
+        if constexpr (PackedBlock) {
+          const int kp_base = g * packed_per_group;
+          for (int kpi = lane; kpi < packed_per_group; kpi += SG) {
+            const int kp = kp_base + kpi;
+            const uint32_t packed_w = qw[qweight_offset(output_major, kp, ni, Kp, n)];
+            const uint16_t* xb = arow + (size_t)kp * 8;
+#pragma unroll
+            for (int bb = 0; bb < 8; ++bb) {
+              const int w = (int)((packed_w >> (bb * 4)) & 0xFu) - 8;
+              partial += bf16_to_fp32(xb[bb]) * (float)w;
+            }
+          }
+        } else {
+          const int kbase = g * gs;
+          for (int t = lane; t < gs; t += SG) {
+            const int kk = kbase + t;
+            const uint32_t packed_w = qw[qweight_offset(output_major, kk >> 3, ni, Kp, n)];
+            const int w = (int)((packed_w >> ((kk & 7) * 4)) & 0xFu) - 8;
+            partial += bf16_to_fp32(arow[kk]) * (float)w;
+          }
+        }
+        const float group_sum = sycl::reduce_over_group(it.get_sub_group(), partial, sycl::plus<float>());
+        if (lane == 0) acc += group_sum * sc[weight_scale_offset(output_major, g, ni, numg, n)];
+      }
+      if (lane == 0) out[(size_t)active_idx * (size_t)n + (size_t)ni] = acc;
+    });
+  });
+}
+
+static inline sycl::event gemm_gptq_int4_sycl_subgroup_contiguous_submit_dispatch(
+    int sg, bool packed, int active, int n, int k, const uint16_t* input, const int32_t* expert_ids,
+    const uint32_t* qw_base, const float* sc_base, size_t qw_expert_stride, size_t sc_expert_stride,
+    float* out, int group_size, const sycl::event* dependency = nullptr) {
+  switch (sg) {
+    case 8:
+      return packed ? gemm_gptq_int4_sycl_subgroup_contiguous_submit<8, true>(
+                          active, n, k, input, expert_ids, qw_base, sc_base, qw_expert_stride, sc_expert_stride,
+                          out, group_size, dependency)
+                    : gemm_gptq_int4_sycl_subgroup_contiguous_submit<8, false>(
+                          active, n, k, input, expert_ids, qw_base, sc_base, qw_expert_stride, sc_expert_stride,
+                          out, group_size, dependency);
+    case 32:
+      return packed ? gemm_gptq_int4_sycl_subgroup_contiguous_submit<32, true>(
+                          active, n, k, input, expert_ids, qw_base, sc_base, qw_expert_stride, sc_expert_stride,
+                          out, group_size, dependency)
+                    : gemm_gptq_int4_sycl_subgroup_contiguous_submit<32, false>(
+                          active, n, k, input, expert_ids, qw_base, sc_base, qw_expert_stride, sc_expert_stride,
+                          out, group_size, dependency);
+    case 16:
+    default:
+      return packed ? gemm_gptq_int4_sycl_subgroup_contiguous_submit<16, true>(
+                          active, n, k, input, expert_ids, qw_base, sc_base, qw_expert_stride, sc_expert_stride,
+                          out, group_size, dependency)
+                    : gemm_gptq_int4_sycl_subgroup_contiguous_submit<16, false>(
+                          active, n, k, input, expert_ids, qw_base, sc_base, qw_expert_stride, sc_expert_stride,
+                          out, group_size, dependency);
   }
 }
 
@@ -1200,6 +1851,82 @@ class SYCL_GPTQ_INT4_MOE_TP : public AVX2_MOE_BASE<T, SYCL_GPTQ_INT4_MOE_TP<T>> 
     }
   }
 
+  sycl_int4::FusedScratch* prepare_expert_batch_tables(int activated_expert, int qlen) {
+    if (activated_expert <= 0 || qlen != 1) return nullptr;
+    for (int task_id = 0; task_id < activated_expert; ++task_id) {
+      const int expert_idx = m_expert_id_map_[task_id];
+      if (m_local_num_[expert_idx] != qlen) return nullptr;
+    }
+    auto* s = reinterpret_cast<sycl_int4::FusedScratch*>(fused_scratch_);
+    if (s == nullptr) {
+      s = new sycl_int4::FusedScratch();
+      fused_scratch_ = s;
+    }
+    if (s->gu_cap < activated_expert) {
+      if (s->expert_batch_pending) s->expert_batch_gate_up_event.wait_and_throw();
+      sycl_int4::usm_free(s->gu_a);
+      sycl_int4::usm_free(s->gu_out);
+      sycl_int4::usm_free(s->gu_gq);
+      sycl_int4::usm_free(s->gu_uq);
+      sycl_int4::usm_free(s->gu_gs);
+      sycl_int4::usm_free(s->gu_us);
+      sycl_int4::usm_free(s->gu_dq);
+      sycl_int4::usm_free(s->gu_ds);
+      sycl_int4::usm_free(s->gu_down_out);
+      const int cap = std::max(activated_expert, 1);
+      s->gu_a = sycl_int4::usm_alloc<uint16_t*>(cap, "expert batch input ptrs");
+      s->gu_out = sycl_int4::usm_alloc<uint16_t*>(cap, "expert batch activation ptrs");
+      s->gu_gq = sycl_int4::usm_alloc<uint32_t*>(cap, "expert batch gate q ptrs");
+      s->gu_uq = sycl_int4::usm_alloc<uint32_t*>(cap, "expert batch up q ptrs");
+      s->gu_gs = sycl_int4::usm_alloc<float*>(cap, "expert batch gate scale ptrs");
+      s->gu_us = sycl_int4::usm_alloc<float*>(cap, "expert batch up scale ptrs");
+      s->gu_dq = sycl_int4::usm_alloc<uint32_t*>(cap, "expert batch down q ptrs");
+      s->gu_ds = sycl_int4::usm_alloc<float*>(cap, "expert batch down scale ptrs");
+      s->gu_down_out = sycl_int4::usm_alloc<float*>(cap, "expert batch down output ptrs");
+      s->gu_cap = cap;
+    }
+    for (int task_id = 0; task_id < activated_expert; ++task_id) {
+      const int expert_idx = m_expert_id_map_[task_id];
+      s->gu_a[task_id] = gate_up_ba_[expert_idx]->data;
+      s->gu_out[task_id] = down_ba_[expert_idx]->data;
+      s->gu_gq[task_id] = gate_bb_[expert_idx]->qw;
+      s->gu_uq[task_id] = up_bb_[expert_idx]->qw;
+      s->gu_gs[task_id] = gate_bb_[expert_idx]->scales;
+      s->gu_us[task_id] = up_bb_[expert_idx]->scales;
+      s->gu_dq[task_id] = down_bb_[expert_idx]->qw;
+      s->gu_ds[task_id] = down_bb_[expert_idx]->scales;
+      s->gu_down_out[task_id] = down_bc_[expert_idx]->data;
+    }
+    return s;
+  }
+
+  sycl_int4::FusedScratch* prepare_contiguous_expert_batch(int activated_expert, int qlen) {
+    if (activated_expert <= 0 || qlen != 1) return nullptr;
+    auto* s = reinterpret_cast<sycl_int4::FusedScratch*>(fused_scratch_);
+    if (s == nullptr || !s->contiguous_weights_ready) return nullptr;
+    for (int task_id = 0; task_id < activated_expert; ++task_id) {
+      const int expert_idx = m_expert_id_map_[task_id];
+      if (m_local_num_[expert_idx] != qlen) return nullptr;
+    }
+    if (s->contiguous_batch_cap < activated_expert) {
+      if (s->expert_batch_pending) s->expert_batch_gate_up_event.wait_and_throw();
+      sycl_int4::usm_free(s->contiguous_expert_ids);
+      sycl_int4::usm_free(s->contiguous_act);
+      sycl_int4::usm_free(s->contiguous_down_out);
+      const int cap = std::max(activated_expert, 1);
+      s->contiguous_expert_ids = sycl_int4::usm_alloc<int32_t>(cap, "contiguous batch expert ids");
+      s->contiguous_act = sycl_int4::usm_alloc<uint16_t>((size_t)cap * config_.intermediate_size,
+                                                         "contiguous batch activation");
+      s->contiguous_down_out = sycl_int4::usm_alloc<float>((size_t)cap * config_.hidden_size,
+                                                           "contiguous batch down output");
+      s->contiguous_batch_cap = cap;
+    }
+    for (int task_id = 0; task_id < activated_expert; ++task_id) {
+      s->contiguous_expert_ids[task_id] = m_expert_id_map_[task_id];
+    }
+    return s;
+  }
+
   bool use_fused_down_decode() const {
     const bool use_subgroup = sycl_int4::env_eq("KT_SYCL_INT4_PER_GEMM_KERNEL", "subgroup") ||
                               sycl_int4::env_eq("KT_SYCL_INT4_PER_GEMM_KERNEL", "sg");
@@ -1213,8 +1940,60 @@ class SYCL_GPTQ_INT4_MOE_TP : public AVX2_MOE_BASE<T, SYCL_GPTQ_INT4_MOE_TP<T>> 
     const bool use_packed = sycl_int4::env_flag("KT_SYCL_INT4_DOWN_PACKED", true);
     const int down_subgroup_size =
         use_packed ? sycl_int4::env_int("KT_SYCL_INT4_DOWN_PACKED_SUBGROUP", 16) : subgroup_size;
+    const bool use_q8_down = sycl_int4::env_flag("KT_SYCL_INT4_DOWN_Q8", false);
+    const bool use_output_lanes =
+        use_packed && sycl_int4::env_flag("KT_SYCL_INT4_DOWN_OUTPUT_LANES", false);
+    const int down_lanes_per_output =
+        use_output_lanes ? sycl_int4::env_int("KT_SYCL_INT4_DOWN_LANES_PER_OUTPUT", 1) : 1;
+    const int down_wg_rows = use_packed ? sycl_int4::env_int("KT_SYCL_INT4_DOWN_WG_ROWS", 1) : 1;
+    const char* down_kernel =
+        use_q8_down          ? "subgroup_q8_dp4a_wg2"
+        : !use_packed        ? "subgroup"
+        : use_output_lanes && down_lanes_per_output == 2  ? "subgroup_packed_output_lanes2"
+        : use_output_lanes && down_lanes_per_output == 4  ? "subgroup_packed_output_lanes4"
+        : use_output_lanes && down_lanes_per_output == 8  ? "subgroup_packed_output_lanes8"
+        : use_output_lanes && down_lanes_per_output == 16 ? "subgroup_packed_output_lanes16"
+        : use_output_lanes   ? "subgroup_packed_output_lanes1"
+        : down_wg_rows == 2  ? "subgroup_packed_wg2"
+        : down_wg_rows == 4  ? "subgroup_packed_wg4"
+        : down_wg_rows == 8  ? "subgroup_packed_wg8"
+        : down_wg_rows == 16 ? "subgroup_packed_wg16"
+        : down_wg_rows == 32 ? "subgroup_packed_wg32"
+                             : "subgroup_packed";
     const bool trace = sycl_int4::env_int("KT_SYCL_INT4_TRACE_EVERY", 0) > 0;
     auto* s = reinterpret_cast<sycl_int4::FusedScratch*>(fused_scratch_);
+    const bool use_expert_batch =
+        sycl_int4::env_flag("KT_SYCL_INT4_EXPERT_BATCH", false) && s != nullptr && s->expert_batch_pending &&
+        s->expert_batch_active == activated_expert && s->contiguous_weights_ready;
+    if (use_expert_batch) {
+      sycl_int4::trace_gemm_limited("down_expert_batch", config_.layer_idx, -1, qlen, config_.hidden_size,
+                                    config_.intermediate_size);
+      const uint64_t t0 = trace ? sycl_int4::now_us() : 0;
+      sycl::event down_event = sycl_int4::gemm_gptq_int4_sycl_subgroup_contiguous_submit_dispatch(
+          down_subgroup_size, use_packed, activated_expert, config_.hidden_size, config_.intermediate_size,
+          s->contiguous_act, s->contiguous_expert_ids, s->contig_dq, s->contig_ds,
+          s->contig_d_qw_stride, s->contig_d_sc_stride, s->contiguous_down_out,
+          config_.quant_config.group_size, &s->expert_batch_gate_up_event);
+      down_event.wait_and_throw();
+      s->expert_batch_pending = false;
+      s->expert_batch_active = 0;
+      s->gate_up_pipeline_pending = false;
+      s->gate_up_pipeline_active = 0;
+      for (int task_id = 0; task_id < activated_expert; ++task_id) {
+        const int expert_idx = m_expert_id_map_[task_id];
+        const float* src = s->contiguous_down_out + (size_t)task_id * config_.hidden_size;
+        ggml_bf16_t* dst = m_local_down_output_ptr_[expert_idx];
+        for (int j = 0; j < config_.hidden_size; ++j) dst[j] = GGML_FP32_TO_BF16(src[j]);
+      }
+      if (trace) {
+        sycl_int4::trace_down_async_timing(
+            config_.layer_idx, activated_expert, config_.hidden_size, config_.intermediate_size,
+            down_subgroup_size, sycl_int4::now_us() - t0, true,
+            use_packed ? "subgroup_packed_contiguous_expert_batch"
+                       : "subgroup_contiguous_expert_batch");
+      }
+      return;
+    }
     const bool use_pipeline = sycl_int4::env_flag("KT_SYCL_INT4_GATE_UP_DOWN_PIPELINE", false);
     const bool has_pipeline =
         use_pipeline && s != nullptr && s->gate_up_pipeline_pending &&
@@ -1226,6 +2005,34 @@ class SYCL_GPTQ_INT4_MOE_TP : public AVX2_MOE_BASE<T, SYCL_GPTQ_INT4_MOE_TP<T>> 
     sycl_int4::trace_gemm_limited("down_async", config_.layer_idx, -1, qlen, config_.hidden_size,
                                   config_.intermediate_size);
     const uint64_t t0 = trace ? sycl_int4::now_us() : 0;
+    sycl::event q8_quant_event;
+    if (use_q8_down) {
+      if (s == nullptr) {
+        s = new sycl_int4::FusedScratch();
+        fused_scratch_ = s;
+      }
+      if (s->down_q8_cap < activated_expert) {
+        sycl_int4::usm_free(s->down_q8_inputs);
+        sycl_int4::usm_free(s->down_q8_xq);
+        sycl_int4::usm_free(s->down_q8_xs);
+        const int cap = std::max(activated_expert, 1);
+        s->down_q8_inputs = sycl_int4::usm_alloc<uint16_t*>(cap, "down q8 input pointers");
+        s->down_q8_xq = sycl_int4::usm_alloc<int8_t>((size_t)cap * config_.intermediate_size,
+                                                      "down q8 activations");
+        s->down_q8_xs = sycl_int4::usm_alloc<float>(
+            (size_t)cap * (config_.intermediate_size / config_.quant_config.group_size),
+            "down q8 activation scales");
+        s->down_q8_cap = cap;
+      }
+      for (int task_id = 0; task_id < activated_expert; ++task_id) {
+        const int expert_idx = m_expert_id_map_[task_id];
+        s->down_q8_inputs[task_id] = down_ba_[expert_idx]->data;
+      }
+      const std::vector<sycl::event>* dependencies = has_pipeline ? &s->gate_up_pipeline_events : nullptr;
+      q8_quant_event = sycl_int4::quantize_bf16_i8_groups_batched_submit(
+          activated_expert, config_.intermediate_size, config_.quant_config.group_size,
+          s->down_q8_inputs, s->down_q8_xq, s->down_q8_xs, dependencies);
+    }
     for (int task_id = 0; task_id < activated_expert; ++task_id) {
       const int expert_idx = m_expert_id_map_[task_id];
       const int m = m_local_num_[expert_idx];
@@ -1233,10 +2040,23 @@ class SYCL_GPTQ_INT4_MOE_TP : public AVX2_MOE_BASE<T, SYCL_GPTQ_INT4_MOE_TP<T>> 
           has_pipeline && s->gate_up_pipeline_experts[(size_t)task_id] == expert_idx
               ? &s->gate_up_pipeline_events[(size_t)task_id]
               : nullptr;
-      if (use_packed) {
-        events.push_back(sycl_int4::gemm_gptq_int4_sycl_subgroup_packed_submit_dispatch(
-            down_subgroup_size, m, config_.hidden_size, config_.intermediate_size, *down_ba_[expert_idx],
-            *down_bb_[expert_idx], *down_bc_[expert_idx], 0, 1, dependency));
+      if (use_q8_down) {
+        const int num_groups = config_.intermediate_size / config_.quant_config.group_size;
+        events.push_back(sycl_int4::gemm_gptq_int4_sycl_subgroup_q8_dp4a_tiled_submit_dispatch(
+            down_subgroup_size, down_wg_rows, config_.hidden_size, config_.intermediate_size,
+            s->down_q8_xq + (size_t)task_id * config_.intermediate_size,
+            s->down_q8_xs + (size_t)task_id * num_groups, *down_bb_[expert_idx],
+            *down_bc_[expert_idx], &q8_quant_event));
+      } else if (use_packed) {
+        if (use_output_lanes) {
+          events.push_back(sycl_int4::gemm_gptq_int4_sycl_subgroup_output_lanes_submit_dispatch(
+              down_subgroup_size, down_lanes_per_output, m, config_.hidden_size, config_.intermediate_size,
+              *down_ba_[expert_idx], *down_bb_[expert_idx], *down_bc_[expert_idx], 0, 1, dependency));
+        } else {
+          events.push_back(sycl_int4::gemm_gptq_int4_sycl_subgroup_packed_tiled_submit_dispatch(
+              down_subgroup_size, down_wg_rows, m, config_.hidden_size, config_.intermediate_size,
+              *down_ba_[expert_idx], *down_bb_[expert_idx], *down_bc_[expert_idx], 0, 1, dependency));
+        }
       } else {
         events.push_back(sycl_int4::gemm_gptq_int4_sycl_subgroup_submit_dispatch(
             down_subgroup_size, m, config_.hidden_size, config_.intermediate_size, *down_ba_[expert_idx],
@@ -1256,7 +2076,7 @@ class SYCL_GPTQ_INT4_MOE_TP : public AVX2_MOE_BASE<T, SYCL_GPTQ_INT4_MOE_TP<T>> 
       sycl_int4::trace_down_async_timing(config_.layer_idx, activated_expert, config_.hidden_size,
                                          config_.intermediate_size, down_subgroup_size,
                                          sycl_int4::now_us() - t0, has_pipeline,
-                                         use_packed ? "subgroup_packed" : "subgroup");
+                                         down_kernel);
     }
   }
 
@@ -1286,47 +2106,54 @@ class SYCL_GPTQ_INT4_MOE_TP : public AVX2_MOE_BASE<T, SYCL_GPTQ_INT4_MOE_TP<T>> 
                            sycl_int4::env_eq("KT_SYCL_INT4_DECODE_MODE", "per_gemm_gateup_batch") ||
                            sycl_int4::env_eq("KT_SYCL_INT4_DECODE_MODE", "gateup_batch") ||
                            sycl_int4::env_eq("KT_SYCL_INT4_DECODE_MODE", "gate_up_batch");
+    const bool request_expert_batch =
+        !use_q8_gate_up && sycl_int4::env_flag("KT_SYCL_INT4_EXPERT_BATCH", false) &&
+        sycl_int4::env_flag("KT_SYCL_INT4_DOWN_ASYNC", true);
+    if (request_expert_batch) {
+      auto* s = prepare_contiguous_expert_batch(activated_expert, qlen);
+      if (s != nullptr) {
+        sycl_int4::trace_gemm_limited("gate_up_expert_batch", config_.layer_idx, -1, qlen,
+                                      config_.intermediate_size, config_.hidden_size);
+        const uint64_t t0 = trace ? sycl_int4::now_us() : 0;
+        const int first_expert = m_expert_id_map_[0];
+        s->expert_batch_gate_up_event =
+            sycl_int4::gate_up_activation_gptq_int4_sycl_subgroup_contiguous_submit_dispatch(
+                use_packed_gate_up ? packed_gate_up_subgroup_size : subgroup_size, use_packed_gate_up,
+                activated_expert, config_.intermediate_size, config_.hidden_size,
+                gate_up_ba_[first_expert]->data, s->contiguous_expert_ids, s->contig_gq, s->contig_uq,
+                s->contig_gs, s->contig_us, s->contig_gu_qw_stride, s->contig_gu_sc_stride,
+                s->contiguous_act, config_.quant_config.group_size, config_.swiglu_limit,
+                config_.swiglu_alpha, fast_silu);
+        s->expert_batch_active = activated_expert;
+        s->expert_batch_pending = true;
+        s->gate_up_pipeline_pending = false;
+        s->gate_up_pipeline_active = 0;
+        if (trace) {
+          sycl_int4::trace_gate_up_pipeline_submit_timing(
+              config_.layer_idx, activated_expert, config_.intermediate_size, config_.hidden_size,
+              use_packed_gate_up ? packed_gate_up_subgroup_size : subgroup_size, sycl_int4::now_us() - t0,
+              use_packed_gate_up ? "subgroup_fused_packed_contiguous_expert_batch"
+                                 : "subgroup_fused_contiguous_expert_batch");
+        }
+        return;
+      }
+    }
     if (use_batch) {
-      auto* s = reinterpret_cast<sycl_int4::FusedScratch*>(fused_scratch_);
-      if (s == nullptr) {
-        s = new sycl_int4::FusedScratch();
-        fused_scratch_ = s;
-      }
-      if (s->gu_cap < activated_expert) {
-        sycl_int4::usm_free(s->gu_a);
-        sycl_int4::usm_free(s->gu_out);
-        sycl_int4::usm_free(s->gu_gq);
-        sycl_int4::usm_free(s->gu_uq);
-        sycl_int4::usm_free(s->gu_gs);
-        sycl_int4::usm_free(s->gu_us);
-        const int cap = std::max(activated_expert, 1);
-        s->gu_a = sycl_int4::usm_alloc<uint16_t*>(cap, "gate_up batch a ptrs");
-        s->gu_out = sycl_int4::usm_alloc<uint16_t*>(cap, "gate_up batch out ptrs");
-        s->gu_gq = sycl_int4::usm_alloc<uint32_t*>(cap, "gate_up batch gate q ptrs");
-        s->gu_uq = sycl_int4::usm_alloc<uint32_t*>(cap, "gate_up batch up q ptrs");
-        s->gu_gs = sycl_int4::usm_alloc<float*>(cap, "gate_up batch gate scale ptrs");
-        s->gu_us = sycl_int4::usm_alloc<float*>(cap, "gate_up batch up scale ptrs");
-        s->gu_cap = cap;
-      }
-      for (int task_id = 0; task_id < activated_expert; ++task_id) {
-        const int expert_idx = m_expert_id_map_[task_id];
-        s->gu_a[task_id] = gate_up_ba_[expert_idx]->data;
-        s->gu_out[task_id] = down_ba_[expert_idx]->data;
-        s->gu_gq[task_id] = gate_bb_[expert_idx]->qw;
-        s->gu_uq[task_id] = up_bb_[expert_idx]->qw;
-        s->gu_gs[task_id] = gate_bb_[expert_idx]->scales;
-        s->gu_us[task_id] = up_bb_[expert_idx]->scales;
-      }
+      auto* s = prepare_expert_batch_tables(activated_expert, qlen);
+      if (s == nullptr) return;
       sycl_int4::trace_gemm_limited("gate_up_batch", config_.layer_idx, -1, qlen, config_.intermediate_size,
                                     config_.hidden_size);
       const uint64_t t0 = trace ? sycl_int4::now_us() : 0;
-      sycl_int4::gate_up_activation_gptq_int4_sycl_subgroup_batched_dispatch(
-          subgroup_size, activated_expert, qlen, config_.intermediate_size, config_.hidden_size, s->gu_a, s->gu_gq,
-          s->gu_uq, s->gu_gs, s->gu_us, s->gu_out, config_.quant_config.group_size, config_.swiglu_limit,
-          config_.swiglu_alpha, fast_silu);
+      sycl::event batch_event = sycl_int4::gate_up_activation_gptq_int4_sycl_subgroup_batched_submit_dispatch(
+          use_packed_gate_up ? packed_gate_up_subgroup_size : subgroup_size, use_packed_gate_up, activated_expert,
+          qlen, config_.intermediate_size, config_.hidden_size, s->gu_a, s->gu_gq, s->gu_uq, s->gu_gs, s->gu_us,
+          s->gu_out, config_.quant_config.group_size, config_.swiglu_limit, config_.swiglu_alpha, fast_silu);
+      batch_event.wait_and_throw();
       if (trace) {
         sycl_int4::trace_gate_up_batch_timing(config_.layer_idx, activated_expert, config_.intermediate_size,
-                                              config_.hidden_size, subgroup_size, sycl_int4::now_us() - t0);
+                                              config_.hidden_size,
+                                              use_packed_gate_up ? packed_gate_up_subgroup_size : subgroup_size,
+                                              sycl_int4::now_us() - t0);
       }
       return;
     }
@@ -2352,12 +3179,77 @@ class SYCL_GPTQ_INT4_MOE_TP : public AVX2_MOE_BASE<T, SYCL_GPTQ_INT4_MOE_TP<T>> 
                 (double)bytes / (1024.0 * 1024.0), experts);
   }
 
+  void configure_projection_weight_storage() {
+    const bool gate_up_device = sycl_int4::gate_up_device_weights_enabled();
+    const bool down_device = sycl_int4::down_device_weights_enabled();
+    for (int e = 0; e < config_.expert_num; ++e) {
+      gate_bb_[e]->device_storage = gate_up_device;
+      up_bb_[e]->device_storage = gate_up_device;
+      down_bb_[e]->device_storage = down_device;
+    }
+  }
+
+  void prepare_contiguous_weight_storage() {
+    if (!sycl_int4::contiguous_weights_enabled() || config_.expert_num <= 0) return;
+    auto* s = reinterpret_cast<sycl_int4::FusedScratch*>(fused_scratch_);
+    if (s == nullptr) {
+      s = new sycl_int4::FusedScratch();
+      fused_scratch_ = s;
+    }
+    if (s->contiguous_weights_ready) return;
+
+    const size_t experts = (size_t)config_.expert_num;
+    const size_t gu_qw_stride = gate_bb_[0]->qweight_bytes() / sizeof(uint32_t);
+    const size_t gu_sc_stride = gate_bb_[0]->scales_bytes() / sizeof(float);
+    const size_t d_qw_stride = down_bb_[0]->qweight_bytes() / sizeof(uint32_t);
+    const size_t d_sc_stride = down_bb_[0]->scales_bytes() / sizeof(float);
+    const bool gate_up_device = gate_bb_[0]->device_storage;
+    const bool down_device = down_bb_[0]->device_storage;
+    const auto alloc_qw = [&](size_t elems, bool device_storage, const char* name) {
+      return device_storage ? sycl_int4::usm_alloc_device<uint32_t>(elems, name)
+                            : sycl_int4::usm_alloc<uint32_t>(elems, name);
+    };
+    const auto alloc_sc = [&](size_t elems, bool device_storage, const char* name) {
+      return device_storage ? sycl_int4::usm_alloc_device<float>(elems, name)
+                            : sycl_int4::usm_alloc<float>(elems, name);
+    };
+
+    s->contig_gq = alloc_qw(experts * gu_qw_stride, gate_up_device, "contiguous gate qweights");
+    s->contig_uq = alloc_qw(experts * gu_qw_stride, gate_up_device, "contiguous up qweights");
+    s->contig_dq = alloc_qw(experts * d_qw_stride, down_device, "contiguous down qweights");
+    s->contig_gs = alloc_sc(experts * gu_sc_stride, gate_up_device, "contiguous gate scales");
+    s->contig_us = alloc_sc(experts * gu_sc_stride, gate_up_device, "contiguous up scales");
+    s->contig_ds = alloc_sc(experts * d_sc_stride, down_device, "contiguous down scales");
+    s->contig_gu_qw_stride = gu_qw_stride;
+    s->contig_gu_sc_stride = gu_sc_stride;
+    s->contig_d_qw_stride = d_qw_stride;
+    s->contig_d_sc_stride = d_sc_stride;
+
+    for (size_t e = 0; e < experts; ++e) {
+      const bool own_slab = e == 0;
+      gate_bb_[e]->bind_external(s->contig_gq + e * gu_qw_stride, s->contig_gs + e * gu_sc_stride, own_slab);
+      up_bb_[e]->bind_external(s->contig_uq + e * gu_qw_stride, s->contig_us + e * gu_sc_stride, own_slab);
+      down_bb_[e]->bind_external(s->contig_dq + e * d_qw_stride, s->contig_ds + e * d_sc_stride, own_slab);
+    }
+    s->contiguous_weights_ready = true;
+    const size_t total_bytes =
+        experts * ((2 * gu_qw_stride + d_qw_stride) * sizeof(uint32_t) +
+                   (2 * gu_sc_stride + d_sc_stride) * sizeof(float));
+    std::printf("[SYCL_GPTQ_INT4] layer=%d contiguous expert weights: %.2f MiB experts=%d "
+                "output_major=%d gate_up_device=%d down_device=%d\n",
+                config_.layer_idx, (double)total_bytes / (1024.0 * 1024.0), config_.expert_num,
+                sycl_int4::weight_reorder_enabled() ? 1 : 0, gate_up_device ? 1 : 0,
+                down_device ? 1 : 0);
+  }
+
   // Load GPTQ int4 weights from contiguous per-expert memory (qweight uint32 + scales float).
   void load_weights() {
     const int group_size = config_.quant_config.group_size;
     const uint64_t* p2l = (const uint64_t*)config_.physical_to_logical_map;
     auto pool = config_.pool->get_subpool(tp_part_idx);
     if (config_.gate_scale == nullptr) throw std::runtime_error("SYCL GPTQ-Int4 MOE requires scale pointers.");
+    configure_projection_weight_storage();
+    prepare_contiguous_weight_storage();
 
     const int gate_up_k = config_.hidden_size, gate_up_n = config_.intermediate_size;
     const size_t gu_qw = (size_t)(gate_up_k / 8) * gate_up_n;
