@@ -1,0 +1,11 @@
+candidate,baseline,metric,unit,effect,effect_pct,ci95_low,ci95_high
+dynamic-v5,phase-fixed,prefill_tps,token/s,improvement,0.7476734863378187,0.19077593498563472,1.6399981803407515
+dynamic-v5,phase-fixed,decode_tps,token/s,improvement,52.74818764544105,48.04837416826617,57.635279675831306
+dynamic-v5,phase-fixed,ttft_ms,ms,reduction,0.7494338081427965,0.19322015595875514,1.6117081813133436
+dynamic-v5,phase-fixed,tpot_ms,ms/token,reduction,34.6163685935478,32.50046933609958,36.59286406136065
+dynamic-v5,phase-fixed,e2e_ms,ms,reduction,28.93848735934452,27.09337822014092,30.672484850465608
+dynamic-v5,packed-cpu-fixed,prefill_tps,token/s,improvement,-0.16073574916700695,-0.4155033604374442,0.16636409100873237
+dynamic-v5,packed-cpu-fixed,decode_tps,token/s,improvement,-0.5759599884482824,-0.8089365871828976,-0.3841878821620237
+dynamic-v5,packed-cpu-fixed,ttft_ms,ms,reduction,-0.15996789668852873,-0.41535812761869184,0.1700047028953544
+dynamic-v5,packed-cpu-fixed,tpot_ms,ms/token,reduction,-0.5788762699341587,-0.8157832716007279,-0.38544375603141173
+dynamic-v5,packed-cpu-fixed,e2e_ms,ms,reduction,-0.4804605060171774,-0.5957501182538028,-0.36693256694895204

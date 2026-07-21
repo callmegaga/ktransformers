@@ -1,0 +1,87 @@
+{
+  "bootstrap_samples": 20000,
+  "candidate": "dynamic",
+  "created_at": "2026-07-21T09:18:39.683572+08:00",
+  "inputs": [
+    {
+      "artifact": "/home/wy/Work/ktransformers/artifacts/running-server-sweeps/dynamic-pilot-b1-20260720",
+      "backend": "dynamic",
+      "block": 1,
+      "block_label": "pilot-b1",
+      "realized_load_order": [
+        0,
+        12,
+        20,
+        16,
+        8,
+        4
+      ],
+      "strategy": "dynamic"
+    },
+    {
+      "artifact": "/home/wy/Work/ktransformers/artifacts/running-server-sweeps/packed-cpu-fixed-pilot-b1-20260720",
+      "backend": "packed-cpu-fixed",
+      "block": 1,
+      "block_label": "pilot-b1",
+      "realized_load_order": [
+        0,
+        12,
+        20,
+        16,
+        8,
+        4
+      ],
+      "strategy": "packed-cpu-fixed"
+    },
+    {
+      "artifact": "/home/wy/Work/ktransformers/artifacts/running-server-sweeps/igpu-fixed-pilot-b1-20260720",
+      "backend": "igpu-fixed",
+      "block": 1,
+      "block_label": "pilot-b1",
+      "realized_load_order": [
+        0,
+        12,
+        20,
+        16,
+        8,
+        4
+      ],
+      "strategy": "igpu-fixed"
+    }
+  ],
+  "seed": 20260721,
+  "validated_identity": {
+    "extension": {
+      "extensions": [
+        {
+          "path": "/home/wy/Work/ktransformers/kt-kernel/build/lib.linux-x86_64-cpython-311/kt_kernel/kt_kernel_ext.cpython-311-x86_64-linux-gnu.so",
+          "sha256": "bf38fa420c069ca981ac28ac7842131fc1b52b93fa86332b263b94457ed12ead"
+        }
+      ],
+      "package_root": "/home/wy/Work/ktransformers/kt-kernel/build/lib.linux-x86_64-cpython-311"
+    },
+    "protocol_version": "cpu-igpu-steady-v1",
+    "requested_load_workers": [
+      0,
+      4,
+      8,
+      12,
+      16,
+      20
+    ],
+    "source_fingerprints": {
+      "kt-kernel/bench/bench_running_server.py": "e63ce6b738b75140aa384fcd171e85b770491547d447c3e0408e9e2cc247e6b8",
+      "kt-kernel/bench/bench_running_server_load_sweep.py": "e48531c7c2a1fa9ad2016bce44117c3a02403f138610833fd9ecc36109bcf6b0",
+      "kt-kernel/bench/cpu_background_load.py": "6a746618d6690fc342f49b9666d16a3bbb907857d60ac654a7c7c91e26f03d8f",
+      "kt-kernel/ext_bindings.cpp": "ff734b0bd98f392382ece7f92a8078205cf0e1664cc2aed813ef00c24e39582d",
+      "kt-kernel/operators/avx2/gptq_int4_packed_avxvnni-moe.hpp": "dd4b937f379965b9c3294b5a0288e907b1ef1372c4146095c13454f246f32c5e",
+      "kt-kernel/operators/common.hpp": "d7ceb56d1d4965b94b9aad95354ad154ab56fc118e143d12307b9684cfcf116c",
+      "kt-kernel/operators/cpu_igpu_service_scheduler.hpp": "18fbf738fc46b0d75899c6f7ff0ca45441db183f5eb944254981760541501e5f",
+      "kt-kernel/operators/cpu_load_monitor.hpp": "276ab0bb6e518827c0253cada3646cfed122b6f0c86340c9a6c3538300f91645",
+      "kt-kernel/operators/sycl/gptq_int4_cpu_igpu-moe.hpp": "4e541646e683e671d7d1a3deb8e8f7fd410cbf641a66b871bd9581ff4aea3c4d",
+      "kt-kernel/python/utils/amx.py": "a3a3e6e5c946a95e368b53360d8640e704ff016447bf618d80ec4c75bc21f206",
+      "perf-log/35b-test-cpu-igpu.sh": "8e10a6e0c1349ec69d817c73510f079ad023ffe467303c68ab4b378834655dbc"
+    },
+    "workloads": "1024:600"
+  }
+}

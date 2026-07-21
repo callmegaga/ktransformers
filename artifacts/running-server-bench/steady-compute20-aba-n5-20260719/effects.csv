@@ -1,0 +1,6 @@
+candidate,baseline,metric,unit,effect,effect_pct,ci95_low,ci95_high
+dynamic-v5,igpu-fixed,prefill_tps,token/s,improvement,88.14228800897159,70.1085414982852,109.63358928524113
+dynamic-v5,igpu-fixed,decode_tps,token/s,improvement,15.652003971638528,10.28426336072541,20.55247278087673
+dynamic-v5,igpu-fixed,ttft_ms,ms,reduction,47.131029728144405,41.24465380105228,52.33398980064752
+dynamic-v5,igpu-fixed,tpot_ms,ms/token,reduction,13.565000661106064,9.275090110481289,17.10249981136159
+dynamic-v5,igpu-fixed,e2e_ms,ms,reduction,21.35811633106448,17.091886057644455,25.212098590256108

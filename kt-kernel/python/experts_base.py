@@ -16,6 +16,7 @@ import os
 import ctypes
 
 from kt_kernel import kt_kernel_ext
+from .scheduler_telemetry import SchedulerTelemetryWriter
 
 
 def generate_gpu_experts_masks(
@@ -179,8 +180,7 @@ class _MoEBase:
             if numa_nodes is not None:
                 if len(numa_nodes) != threadpool_count:
                     raise ValueError(
-                        f"numa_nodes length ({len(numa_nodes)}) must match "
-                        f"threadpool_count ({threadpool_count})"
+                        f"numa_nodes length ({len(numa_nodes)}) must match " f"threadpool_count ({threadpool_count})"
                     )
                 subpool_numa_map = list(numa_nodes)
             else:
@@ -314,6 +314,7 @@ class BaseMoEWrapper(_MoEBase, ABC):
 
         # Backend-specific initialization happens in subclasses
         self.moe = None
+        self._scheduler_telemetry = SchedulerTelemetryWriter.from_environment(self.layer_idx, self.method)
 
     @abstractmethod
     def load_weights_from_tensors(
@@ -480,6 +481,8 @@ class BaseMoEWrapper(_MoEBase, ABC):
         allow_pending = 1 if BaseMoEWrapper._layer_has_pending_deferred.get(self.layer_idx, False) else 0
         self.cpu_infer.sync_with_cuda_stream(cuda_stream, allow_pending)
         output_gpu[current_slot].copy_(output_cpu[current_slot], non_blocking=True)
+        if self._scheduler_telemetry is not None:
+            self._scheduler_telemetry.record(self.moe, int(flat_hidden_states.shape[0]))
         return output_gpu[current_slot]
 
     def forward(
@@ -541,4 +544,3 @@ class BaseMoEWrapper(_MoEBase, ABC):
         KExpertsCPUBuffer.capture_buffers.clear()
         KExpertsCPUBuffer.temp_bs = 0
         KExpertsCPUBuffer.temp_buffer = tuple()
-

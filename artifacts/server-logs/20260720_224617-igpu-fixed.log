@@ -1,0 +1,7 @@
+# Started: 2026-07-20T22:46:17+08:00
+# Backend: igpu-fixed
+# Method: CPU_IGPU_GPTQ_INT4
+# Endpoint: http://127.0.0.1:30100
+# Model: /home/wy/Work/models/Qwen3.5-35B-A3B-GPTQ-Int4
+# Engine priority: profile=low nice=5 CPUWeight=33
+[35b-test-cpu-igpu.sh] Command: systemd-run --user --scope --quiet -p CPUWeight=33 nice -n 5 python -m sglang.launch_server --host 127.0.0.1 --port 30100 --model /home/wy/Work/models/Qwen3.5-35B-A3B-GPTQ-Int4 --served-model-name Qwen3.5-35B-A3B-GPTQ-Int4 --kt-weight-path /home/wy/Work/models/Qwen3.5-35B-A3B-GPTQ-Int4 --tp 1 --trust-remote-code --mem-fraction-static 0.85 --tool-call-parser qwen3_coder --max-running-requests 1 --max-total-tokens 32000 --max-prefill-tokens 16000 --chunked-prefill-size 4096 --watchdog-timeout 1200 --enable-mixed-chunk --disable-radix-cache --kt-method CPU_IGPU_GPTQ_INT4 --kt-cpuinfer 8 --kt-threadpool-count 1 --kt-num-gpu-experts 24 --disable-shared-experts-fusion --attention-backend triton --disable-cuda-graph --dtype float16

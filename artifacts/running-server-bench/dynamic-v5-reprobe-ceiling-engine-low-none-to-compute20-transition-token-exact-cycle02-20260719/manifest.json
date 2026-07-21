@@ -1,0 +1,85 @@
+{
+  "arguments": {
+    "allow_estimated_usage": false,
+    "allow_short_output": false,
+    "base_url": "http://127.0.0.1:30100",
+    "bootstrap_samples": 500,
+    "disable_cpu_telemetry": false,
+    "fail_fast": true,
+    "model": null,
+    "no_shuffle": false,
+    "output_dir": "artifacts/running-server-bench/dynamic-v5-reprobe-ceiling-engine-low-none-to-compute20-transition-token-exact-cycle02-20260719",
+    "repetitions": 1,
+    "run_label": "dynamic-v5-reprobe-ceiling__engine-low__none-to-compute20__transition-token-exact-cycle02",
+    "scheduler_telemetry_file": "artifacts/server-telemetry/dynamic-v5-reprobe-ceiling-compute20.jsonl",
+    "seed": 20260719,
+    "server_wait_timeout": 30.0,
+    "start_background_after_output_tokens": 150,
+    "start_compute_background_workers": 20,
+    "stop_background_after_output_tokens": null,
+    "stop_background_pid": null,
+    "timeout": 900.0,
+    "transition_static_baseline": false,
+    "warmup_output_tokens": 128,
+    "warmup_prompt_tokens": 256,
+    "warmups": 3,
+    "workloads": [
+      {
+        "output_tokens": 600,
+        "target_prompt_tokens": 1024
+      }
+    ]
+  },
+  "background_transition": {
+    "direction": "low-to-high",
+    "result": {
+      "background_ready_delay_ms": 623.295303,
+      "background_start_output_token": 150,
+      "background_start_pid": 896767,
+      "background_stopped": true,
+      "transition_client_post_tps": 14.369984898442045,
+      "transition_client_pre_tps": 28.3795785174479,
+      "transition_decode_calls_after_signal": 449,
+      "transition_decode_calls_before_signal": 151,
+      "transition_final_igpu_ratio": 1.0,
+      "transition_final_policy_igpu_ratio": 1.0,
+      "transition_first_igpu_execution_delay_calls": 3,
+      "transition_first_igpu_execution_delay_ms": 794.856092,
+      "transition_first_igpu_execution_event_ns": 185184236630350,
+      "transition_first_igpu_execution_ready_delay_ms": 171.560789,
+      "transition_first_igpu_execution_sequence": 1545,
+      "transition_settled_igpu_delay_calls": 3,
+      "transition_settled_igpu_delay_ms": 794.856092,
+      "transition_settled_igpu_event_ns": 185184236630350,
+      "transition_settled_igpu_ready_delay_ms": 171.560789,
+      "transition_settled_igpu_sequence": 1545
+    },
+    "start_after_output_tokens": 150,
+    "workers": 20
+  },
+  "error": null,
+  "expected_sample_count": 1,
+  "finished_at": "2026-07-19T17:33:29.787473+08:00",
+  "run_label": "dynamic-v5-reprobe-ceiling__engine-low__none-to-compute20__transition-token-exact-cycle02",
+  "sample_count": 1,
+  "server": {
+    "base_url": "http://127.0.0.1:30100",
+    "model": "Qwen3.5-35B-A3B-GPTQ-Int4"
+  },
+  "started_at": "2026-07-19T17:32:26.968185+08:00",
+  "status": "complete",
+  "successful_sample_count": 1,
+  "telemetry": {
+    "cpu_enabled": true,
+    "scheduler_event_count": 601,
+    "scheduler_events_file": "scheduler-telemetry.jsonl",
+    "scheduler_source": "/home/wy/Work/ktransformers/artifacts/server-telemetry/dynamic-v5-reprobe-ceiling-compute20.jsonl"
+  },
+  "workloads": [
+    {
+      "label": "p1024-o600",
+      "output_tokens": 600,
+      "target_prompt_tokens": 1024
+    }
+  ]
+}

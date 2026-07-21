@@ -1,0 +1,85 @@
+{
+  "arguments": {
+    "allow_estimated_usage": false,
+    "allow_short_output": false,
+    "base_url": "http://127.0.0.1:30100",
+    "bootstrap_samples": 500,
+    "disable_cpu_telemetry": false,
+    "fail_fast": true,
+    "model": null,
+    "no_shuffle": false,
+    "output_dir": "artifacts/running-server-bench/dynamic-v4-cal32-load-context-engine-low-none-to-compute20-transition-token-exact-cycle03-20260719",
+    "repetitions": 1,
+    "run_label": "dynamic-v4-cal32-load-context__engine-low__none-to-compute20__transition-token-exact-cycle03",
+    "scheduler_telemetry_file": "artifacts/server-telemetry/dynamic-v4-cal32-load-context-compute20.jsonl",
+    "seed": 20260719,
+    "server_wait_timeout": 30.0,
+    "start_background_after_output_tokens": 150,
+    "start_compute_background_workers": 20,
+    "stop_background_after_output_tokens": null,
+    "stop_background_pid": null,
+    "timeout": 900.0,
+    "transition_static_baseline": false,
+    "warmup_output_tokens": 128,
+    "warmup_prompt_tokens": 256,
+    "warmups": 3,
+    "workloads": [
+      {
+        "output_tokens": 600,
+        "target_prompt_tokens": 1024
+      }
+    ]
+  },
+  "background_transition": {
+    "direction": "low-to-high",
+    "result": {
+      "background_ready_delay_ms": 50.703497,
+      "background_start_output_token": 150,
+      "background_start_pid": 875082,
+      "background_stopped": true,
+      "transition_client_post_tps": 16.72240270740367,
+      "transition_client_pre_tps": 29.621211209246894,
+      "transition_decode_calls_after_signal": 450,
+      "transition_decode_calls_before_signal": 150,
+      "transition_final_igpu_ratio": 1.0,
+      "transition_final_policy_igpu_ratio": 1.0,
+      "transition_first_igpu_execution_delay_calls": 2,
+      "transition_first_igpu_execution_delay_ms": 178.310474,
+      "transition_first_igpu_execution_event_ns": 181448667879160,
+      "transition_first_igpu_execution_ready_delay_ms": 127.606977,
+      "transition_first_igpu_execution_sequence": 2531,
+      "transition_settled_igpu_delay_calls": 2,
+      "transition_settled_igpu_delay_ms": 178.310474,
+      "transition_settled_igpu_event_ns": 181448667879160,
+      "transition_settled_igpu_ready_delay_ms": 127.606977,
+      "transition_settled_igpu_sequence": 2531
+    },
+    "start_after_output_tokens": 150,
+    "workers": 20
+  },
+  "error": null,
+  "expected_sample_count": 1,
+  "finished_at": "2026-07-19T16:31:10.495526+08:00",
+  "run_label": "dynamic-v4-cal32-load-context__engine-low__none-to-compute20__transition-token-exact-cycle03",
+  "sample_count": 1,
+  "server": {
+    "base_url": "http://127.0.0.1:30100",
+    "model": "Qwen3.5-35B-A3B-GPTQ-Int4"
+  },
+  "started_at": "2026-07-19T16:30:13.418849+08:00",
+  "status": "complete",
+  "successful_sample_count": 1,
+  "telemetry": {
+    "cpu_enabled": true,
+    "scheduler_event_count": 601,
+    "scheduler_events_file": "scheduler-telemetry.jsonl",
+    "scheduler_source": "/home/wy/Work/ktransformers/artifacts/server-telemetry/dynamic-v4-cal32-load-context-compute20.jsonl"
+  },
+  "workloads": [
+    {
+      "label": "p1024-o600",
+      "output_tokens": 600,
+      "target_prompt_tokens": 1024
+    }
+  ]
+}

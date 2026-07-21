@@ -1,0 +1,14 @@
+{
+  "bootstrap_samples": 10000,
+  "created_at": "2026-07-19T11:51:57.026687+08:00",
+  "cycle_count": 5,
+  "inputs": [
+    "/home/wy/Work/ktransformers/artifacts/running-server-bench/dynamic-v3-stable-engine-low-compute20-to-none-transition-smoke-20260719",
+    "/home/wy/Work/ktransformers/artifacts/running-server-bench/dynamic-v3-stable-engine-low-compute20-to-none-transition-cycle02-20260719",
+    "/home/wy/Work/ktransformers/artifacts/running-server-bench/dynamic-v3-stable-engine-low-compute20-to-none-transition-cycle03-20260719",
+    "/home/wy/Work/ktransformers/artifacts/running-server-bench/dynamic-v3-stable-engine-low-compute20-to-none-transition-cycle04-20260719",
+    "/home/wy/Work/ktransformers/artifacts/running-server-bench/dynamic-v3-stable-engine-low-compute20-to-none-transition-cycle05-20260719"
+  ],
+  "output_dir": "artifacts/running-server-bench/dynamic-v3-stable-engine-low-compute20-to-none-transition-n5-20260719",
+  "seed": 20260719
+}

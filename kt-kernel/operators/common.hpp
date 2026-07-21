@@ -242,6 +242,33 @@ struct GeneralMOEConfig {
   uint8_t* gpu_experts_mask = nullptr;  // Bool mask: true = expert on GPU
   void* physical_to_logical_map = nullptr;
 
+  // Fraction of non-CUDA expert work assigned to the Intel iGPU by the
+  // CPU/iGPU hybrid GPTQ backend. Runtime schedulers may update this value
+  // between forward calls; 0 is CPU-only and 1 is iGPU-only.
+  float cpu_igpu_igpu_ratio = 0.5f;
+  // Negative phase ratios inherit cpu_igpu_igpu_ratio. Explicit values allow
+  // fixed phase mappings for scheduler ablations without enabling adaptation.
+  float cpu_igpu_prefill_ratio = -1.0f;
+  float cpu_igpu_decode_ratio = -1.0f;
+  bool cpu_igpu_dynamic = false;
+  float cpu_igpu_decode_load_low = 0.10f;
+  float cpu_igpu_decode_load_high = 0.20f;
+  float cpu_igpu_prefill_load_low = 0.99f;
+  float cpu_igpu_prefill_load_high = 1.00f;
+  float cpu_igpu_load_ewma_alpha = 0.25f;
+  float cpu_igpu_cost_ewma_alpha = 0.20f;
+  float cpu_igpu_decode_switch_margin = 0.10f;
+  float cpu_igpu_decode_cost_load_match_delta = 0.10f;
+  float cpu_igpu_decode_load_reprobe_delta = 0.25f;
+  int cpu_igpu_load_sample_ms = 50;
+  int cpu_igpu_decode_min_dwell = 4;
+  int cpu_igpu_prefill_min_dwell = 2;
+  int cpu_igpu_decode_calibration_samples = 32;
+  int cpu_igpu_decode_load_reprobe_grace = 64;
+  int cpu_igpu_decode_reprobe_samples = 32;
+  int cpu_igpu_decode_reprobe_interval = 4096;
+  bool external_moe_weights = false;
+
   // Compute num_gpu_experts from gpu_experts_mask
   void compute_num_gpu_experts() {
     num_gpu_experts = 0;

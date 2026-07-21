@@ -1,0 +1,11 @@
+candidate,baseline,metric,unit,effect,effect_pct,ci95_low,ci95_high
+phase-fixed,igpu-fixed,prefill_tps,token/s,improvement,86.04039608170902,70.5265725472708,105.26315650945186
+phase-fixed,igpu-fixed,decode_tps,token/s,improvement,22.799090029123413,14.947943078148276,30.767672836635732
+phase-fixed,igpu-fixed,ttft_ms,ms,reduction,46.612000376520555,41.3513404713451,51.345873371951626
+phase-fixed,igpu-fixed,tpot_ms,ms/token,reduction,18.359043317284808,12.991256345466722,23.53774730324936
+phase-fixed,igpu-fixed,e2e_ms,ms,reduction,24.918623194259826,20.029390847013516,29.547660068840205
+phase-fixed,dynamic-v5-telemetry,prefill_tps,token/s,improvement,-1.117182080385004,-4.85278176710735,2.7650090801248473
+phase-fixed,dynamic-v5-telemetry,decode_tps,token/s,improvement,6.179820333452746,-0.5075237912872899,13.353915023126278
+phase-fixed,dynamic-v5-telemetry,ttft_ms,ms,reduction,-0.9817277487247589,-4.956214017184525,2.790019249948439
+phase-fixed,dynamic-v5-telemetry,tpot_ms,ms/token,reduction,5.546413713017195,-0.5605683204662482,11.683928854287243
+phase-fixed,dynamic-v5-telemetry,e2e_ms,ms,reduction,4.527494379692465,-0.6400453911565812,9.712545162169043

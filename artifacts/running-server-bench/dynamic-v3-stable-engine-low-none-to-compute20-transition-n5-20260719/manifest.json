@@ -1,0 +1,16 @@
+{
+  "bootstrap_samples": 10000,
+  "created_at": "2026-07-19T13:54:45.925728+08:00",
+  "cycle_count": 5,
+  "direction": "low-to-high",
+  "inputs": [
+    "/home/wy/Work/ktransformers/artifacts/running-server-bench/dynamic-v3-stable-engine-low-none-to-compute20-transition-smoke-20260719",
+    "/home/wy/Work/ktransformers/artifacts/running-server-bench/dynamic-v3-stable-engine-low-none-to-compute20-transition-cycle02-20260719",
+    "/home/wy/Work/ktransformers/artifacts/running-server-bench/dynamic-v3-stable-engine-low-none-to-compute20-transition-cycle03-20260719",
+    "/home/wy/Work/ktransformers/artifacts/running-server-bench/dynamic-v3-stable-engine-low-none-to-compute20-transition-cycle04-20260719",
+    "/home/wy/Work/ktransformers/artifacts/running-server-bench/dynamic-v3-stable-engine-low-none-to-compute20-transition-cycle05-20260719"
+  ],
+  "output_dir": "artifacts/running-server-bench/dynamic-v3-stable-engine-low-none-to-compute20-transition-n5-20260719",
+  "seed": 20260719,
+  "target": "igpu"
+}

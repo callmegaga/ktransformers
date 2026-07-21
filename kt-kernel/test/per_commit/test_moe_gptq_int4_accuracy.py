@@ -4,6 +4,7 @@
 
 import importlib.util
 import os
+from types import SimpleNamespace
 import sys
 import types
 from pathlib import Path
@@ -162,8 +163,13 @@ def available_backends():
             has_avx_vnni = False
         if has_avx_vnni:
             backends.append(("AVXVNNI256GPTQInt4_MOE", kt_kernel_ext.moe.AVXVNNI256GPTQInt4_MOE, 0.20))
+            if hasattr(kt_kernel_ext.moe, "AVXVNNI256PackedGPTQInt4_MOE"):
+                backends.append(("AVXVNNI256PackedGPTQInt4_MOE", kt_kernel_ext.moe.AVXVNNI256PackedGPTQInt4_MOE, 0.20))
     if os.environ.get("KT_TEST_SYCL_GPTQ_INT4") == "1" and hasattr(kt_kernel_ext.moe, "SYCLGPTQInt4_MOE"):
         backends.append(("SYCLGPTQInt4_MOE", kt_kernel_ext.moe.SYCLGPTQInt4_MOE, 0.05))
+        if hasattr(kt_kernel_ext.moe, "CPUiGPUGPTQInt4_MOE"):
+            for ratio in (0.0, 0.5, 1.0):
+                backends.append((f"CPUiGPUGPTQInt4_MOE_ratio_{ratio}", kt_kernel_ext.moe.CPUiGPUGPTQInt4_MOE, 0.20))
     return backends
 
 
@@ -228,16 +234,28 @@ def run_backend_accuracy_test(backend_name, backend_cls, threshold, qlen_cases):
 
         config = kt_kernel_ext.moe.MOEConfig(expert_num, num_experts_per_tok, hidden_size, intermediate_size, 0)
         config.max_len = max_len
-        config.gate_proj = gate_qw.data_ptr()
-        config.up_proj = up_qw.data_ptr()
-        config.down_proj = down_qw.data_ptr()
-        config.gate_scale = gate_scales.data_ptr()
-        config.up_scale = up_scales.data_ptr()
-        config.down_scale = down_scales.data_ptr()
+        if backend_name.startswith("CPUiGPUGPTQInt4_MOE_ratio_"):
+            # NativeMoEWrapper supplies individual mmap-backed tensors instead
+            # of one stacked allocation. Exercise the production pointer layout.
+            config.gate_projs = [[gate_qw[e].data_ptr() for e in range(expert_num)]]
+            config.up_projs = [[up_qw[e].data_ptr() for e in range(expert_num)]]
+            config.down_projs = [[down_qw[e].data_ptr() for e in range(expert_num)]]
+            config.gate_scales = [[gate_scales[e].data_ptr() for e in range(expert_num)]]
+            config.up_scales = [[up_scales[e].data_ptr() for e in range(expert_num)]]
+            config.down_scales = [[down_scales[e].data_ptr() for e in range(expert_num)]]
+        else:
+            config.gate_proj = gate_qw.data_ptr()
+            config.up_proj = up_qw.data_ptr()
+            config.down_proj = down_qw.data_ptr()
+            config.gate_scale = gate_scales.data_ptr()
+            config.up_scale = up_scales.data_ptr()
+            config.down_scale = down_scales.data_ptr()
         config.quant_config.bits = 4
         config.quant_config.group_size = group_size
         config.quant_config.zero_point = False
         config.pool = cpu_infer.backend_
+        if backend_name.startswith("CPUiGPUGPTQInt4_MOE_ratio_"):
+            config.cpu_igpu_igpu_ratio = float(backend_name.rsplit("_", 1)[1])
 
         moe = backend_cls(config)
         cpu_infer.submit(moe.load_weights_task(physical_to_logical_map.data_ptr()))
@@ -358,6 +376,69 @@ def test_gptq_int4_backend_selection_rejects_forced_avxvnni_with_large_group_siz
 
     with pytest.raises(RuntimeError, match="group_size=512 is unsupported"):
         amx_utils._select_gptq_int4_backend(512)
+
+
+def test_cpu_igpu_scheduler_defaults_to_dynamic(monkeypatch):
+    amx_utils = load_amx_utils()
+    for name in tuple(os.environ):
+        if name.startswith("KT_CPU_IGPU_"):
+            monkeypatch.delenv(name, raising=False)
+    config = SimpleNamespace()
+
+    amx_utils._configure_cpu_igpu_scheduler(config)
+
+    assert config.cpu_igpu_dynamic is True
+    assert config.cpu_igpu_igpu_ratio == 0.0
+    assert config.cpu_igpu_prefill_ratio == 0.0
+    assert config.cpu_igpu_decode_ratio == 0.0
+    assert config.cpu_igpu_decode_load_low == 0.10
+    assert config.cpu_igpu_decode_load_high == 0.20
+    assert config.cpu_igpu_prefill_load_low == 0.99
+    assert config.cpu_igpu_prefill_load_high == 1.0
+    assert config.cpu_igpu_cost_ewma_alpha == 0.20
+    assert config.cpu_igpu_decode_switch_margin == 0.10
+    assert config.cpu_igpu_decode_cost_load_match_delta == 0.10
+    assert config.cpu_igpu_decode_load_reprobe_delta == 0.25
+    assert config.cpu_igpu_decode_calibration_samples == 32
+    assert config.cpu_igpu_decode_load_reprobe_grace == 64
+    assert config.cpu_igpu_decode_reprobe_samples == 32
+    assert config.cpu_igpu_decode_reprobe_interval == 4096
+
+
+def test_cpu_igpu_scheduler_fixed_environment(monkeypatch):
+    amx_utils = load_amx_utils()
+    monkeypatch.setenv("KT_CPU_IGPU_POLICY", "fixed")
+    monkeypatch.setenv("KT_CPU_IGPU_RATIO", "0.75")
+    config = SimpleNamespace()
+
+    amx_utils._configure_cpu_igpu_scheduler(config)
+
+    assert config.cpu_igpu_dynamic is False
+    assert config.cpu_igpu_igpu_ratio == 0.75
+    assert config.cpu_igpu_prefill_ratio == 0.75
+    assert config.cpu_igpu_decode_ratio == 0.75
+
+
+def test_cpu_igpu_scheduler_phase_fixed_environment(monkeypatch):
+    amx_utils = load_amx_utils()
+    monkeypatch.setenv("KT_CPU_IGPU_POLICY", "phase-fixed")
+    monkeypatch.setenv("KT_CPU_IGPU_PREFILL_RATIO", "0")
+    monkeypatch.setenv("KT_CPU_IGPU_DECODE_RATIO", "1")
+    config = SimpleNamespace()
+
+    amx_utils._configure_cpu_igpu_scheduler(config)
+
+    assert config.cpu_igpu_dynamic is False
+    assert config.cpu_igpu_prefill_ratio == 0.0
+    assert config.cpu_igpu_decode_ratio == 1.0
+
+
+def test_cpu_igpu_scheduler_rejects_invalid_policy(monkeypatch):
+    amx_utils = load_amx_utils()
+    monkeypatch.setenv("KT_CPU_IGPU_POLICY", "adaptive-ish")
+
+    with pytest.raises(ValueError, match="must be 'dynamic', 'fixed', or 'phase-fixed'"):
+        amx_utils._configure_cpu_igpu_scheduler(SimpleNamespace())
 
 
 if __name__ == "__main__":

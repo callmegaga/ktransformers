@@ -113,7 +113,12 @@ int InNumaPool::get_thread_num() {
   return total_worker_count;
 }
 
-void InNumaPool::set_restricted_worker_count(int count) { restricted_worker_count = count; }
+void InNumaPool::set_restricted_worker_count(int count) {
+  if (count <= 0 || count > total_worker_count) {
+    throw std::invalid_argument("restricted worker count must be between 1 and the subpool thread count");
+  }
+  restricted_worker_count = count;
+}
 
 void InNumaPool::wait() {
   for (int i = 0; i < worker_count; i++) {
@@ -282,7 +287,7 @@ void NumaJobDistributor::init(std::vector<int> numa_ids, std::vector<int> thread
   }
 
   workers.resize(numa_count);
-  std::vector<int> numa_threads_count(numa_count, 0);
+  std::vector<int> numa_threads_count(numa_num_configured_nodes(), 0);
   for (int i = 0; i < numa_count; i++) {
     workers[i] = std::thread(&NumaJobDistributor::worker_thread, this, i);
     auto this_numa = numa_ids[i];
@@ -412,6 +417,45 @@ void NumaJobDistributor::worker_thread(int numa_id) {
 }
 
 void WorkerPool::init(WorkerPoolConfig config) {
+  if (config.subpool_count <= 0 || config.subpool_numa_map.size() != static_cast<size_t>(config.subpool_count) ||
+      config.subpool_thread_count.size() != static_cast<size_t>(config.subpool_count)) {
+    throw std::invalid_argument("invalid worker pool configuration");
+  }
+  numa_count = config.subpool_count;
+  total_thread_count = 0;
+  for (int thread_count : config.subpool_thread_count) {
+    if (thread_count <= 0) throw std::invalid_argument("worker subpool thread count must be positive");
+    total_thread_count += thread_count;
+  }
+  threads_per_numa = total_thread_count / numa_count;
+
+  hwloc_topology_t topology;
+  hwloc_topology_init(&topology);
+  hwloc_topology_load(topology);
+  std::vector<int> resolved_threads_per_numa(numa_num_configured_nodes(), 0);
+  for (int i = 0; i < config.subpool_count; ++i) {
+    const int numa_id = config.subpool_numa_map[i];
+    if (numa_id < 0 || numa_id >= static_cast<int>(resolved_threads_per_numa.size())) {
+      hwloc_topology_destroy(topology);
+      throw std::invalid_argument("worker pool NUMA id is out of range");
+    }
+    hwloc_obj_t numa_obj = hwloc_get_obj_by_type(topology, HWLOC_OBJ_NUMANODE, numa_id);
+    if (!numa_obj) continue;
+    for (int thread = 0; thread < config.subpool_thread_count[i]; ++thread) {
+      const int core_index = resolved_threads_per_numa[numa_id] + thread;
+      hwloc_obj_t core_obj =
+          hwloc_get_obj_inside_cpuset_by_type(topology, numa_obj->cpuset, HWLOC_OBJ_CORE, core_index);
+      if (!core_obj) continue;
+      const int cpu_id = hwloc_bitmap_first(core_obj->cpuset);
+      if (cpu_id >= 0) bound_cpu_ids.push_back(cpu_id);
+    }
+    resolved_threads_per_numa[numa_id] += config.subpool_thread_count[i];
+  }
+  hwloc_topology_destroy(topology);
+  std::sort(bound_cpu_ids.begin(), bound_cpu_ids.end());
+  bound_cpu_ids.erase(std::unique(bound_cpu_ids.begin(), bound_cpu_ids.end()), bound_cpu_ids.end());
+  if (bound_cpu_ids.empty()) throw std::runtime_error("worker pool did not resolve any bound CPUs");
+
   printf("WorkerPool[0x%lx] %d subpools, [numa:threads]", (intptr_t)this, config.subpool_count);
   for (int i = 0; i < config.subpool_count; i++) {
     printf("[%d:%d] ", config.subpool_numa_map[i], config.subpool_thread_count[i]);
@@ -421,7 +465,7 @@ void WorkerPool::init(WorkerPoolConfig config) {
   for (int i = 0; i < config.subpool_count; i++) {
     numa_worker_pools.push_back(nullptr);
   }
-  std::vector<int> numa_threads_count(config.subpool_count, 0);
+  std::vector<int> numa_threads_count(numa_num_configured_nodes(), 0);
   for (int i = 0; i < config.subpool_count; i++) {
     auto this_numa = config.subpool_numa_map[i];
     auto this_thread_count = config.subpool_thread_count[i];
@@ -469,9 +513,12 @@ WorkerPool::~WorkerPool() {}
 
 int WorkerPool::get_thread_num() { return total_thread_count; }
 
+const std::vector<int>& WorkerPool::get_bound_cpu_ids() const { return bound_cpu_ids; }
+
 void WorkerPool::set_restricted_worker_count(int count) {
+  if (count <= 0) throw std::invalid_argument("restricted worker count must be positive");
   for (int i = 0; i < numa_count; i++) {
-    numa_worker_pools[i]->set_restricted_worker_count(threads_per_numa);
+    numa_worker_pools[i]->set_restricted_worker_count(std::min(count, config.subpool_thread_count[i]));
   }
 }
 

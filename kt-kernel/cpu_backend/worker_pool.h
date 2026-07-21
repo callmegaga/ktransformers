@@ -142,6 +142,7 @@ class WorkerPool {
   WorkerPool(WorkerPoolConfig config);
   ~WorkerPool();
   int get_thread_num();
+  const std::vector<int>& get_bound_cpu_ids() const;
   void set_restricted_worker_count(int count);
 
   static thread_local int thread_local_id;
@@ -161,6 +162,7 @@ class WorkerPool {
   int total_thread_count;
   int numa_count;
   int threads_per_numa;
+  std::vector<int> bound_cpu_ids;
   std::unique_ptr<NumaJobDistributor> distributor;
 
   std::vector<std::unique_ptr<InNumaPool>> numa_worker_pools;

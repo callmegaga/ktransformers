@@ -1,0 +1,53 @@
+{
+  "arguments": {
+    "allow_estimated_usage": false,
+    "allow_short_output": false,
+    "base_url": "http://127.0.0.1:30100",
+    "bootstrap_samples": 500,
+    "disable_cpu_telemetry": false,
+    "fail_fast": true,
+    "model": null,
+    "no_shuffle": false,
+    "output_dir": "artifacts/running-server-bench/packed-cpu-fixed-engine-low-compute12-smoke-20260718",
+    "repetitions": 3,
+    "run_label": "packed-cpu-fixed__engine-low__compute12__smoke",
+    "scheduler_telemetry_file": "artifacts/server-telemetry/packed-cpu-fixed-compute12.jsonl",
+    "seed": 20260718,
+    "server_wait_timeout": 30.0,
+    "timeout": 900.0,
+    "warmup_output_tokens": 8,
+    "warmup_prompt_tokens": 256,
+    "warmups": 15,
+    "workloads": [
+      {
+        "output_tokens": 300,
+        "target_prompt_tokens": 1024
+      }
+    ]
+  },
+  "error": null,
+  "expected_sample_count": 3,
+  "finished_at": "2026-07-18T22:49:06.657583+08:00",
+  "run_label": "packed-cpu-fixed__engine-low__compute12__smoke",
+  "sample_count": 3,
+  "server": {
+    "base_url": "http://127.0.0.1:30100",
+    "model": "Qwen3.5-35B-A3B-GPTQ-Int4"
+  },
+  "started_at": "2026-07-18T22:44:38.625710+08:00",
+  "status": "complete",
+  "successful_sample_count": 3,
+  "telemetry": {
+    "cpu_enabled": true,
+    "scheduler_event_count": 903,
+    "scheduler_events_file": "scheduler-telemetry.jsonl",
+    "scheduler_source": "/home/wy/Work/ktransformers/artifacts/server-telemetry/packed-cpu-fixed-compute12.jsonl"
+  },
+  "workloads": [
+    {
+      "label": "p1024-o300",
+      "output_tokens": 300,
+      "target_prompt_tokens": 1024
+    }
+  ]
+}

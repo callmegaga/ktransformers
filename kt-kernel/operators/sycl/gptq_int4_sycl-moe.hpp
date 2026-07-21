@@ -38,6 +38,9 @@ struct BackendScratch {
   float* gate_scales = nullptr;
   float* up_scales = nullptr;
   float* down_scales = nullptr;
+  int16_t* gate_weight_sums = nullptr;
+  int16_t* up_weight_sums = nullptr;
+  int16_t* down_weight_sums = nullptr;
   size_t gate_up_qweight_stride = 0;
   size_t gate_up_scale_stride = 0;
   size_t down_qweight_stride = 0;
@@ -66,12 +69,18 @@ struct BackendScratch {
     usm_free(gate_scales);
     usm_free(up_scales);
     usm_free(down_scales);
+    usm_free(gate_weight_sums);
+    usm_free(up_weight_sums);
+    usm_free(down_weight_sums);
     gate_qweight = nullptr;
     up_qweight = nullptr;
     down_qweight = nullptr;
     gate_scales = nullptr;
     up_scales = nullptr;
     down_scales = nullptr;
+    gate_weight_sums = nullptr;
+    up_weight_sums = nullptr;
+    down_weight_sums = nullptr;
     weights_ready = false;
   }
 
@@ -155,6 +164,7 @@ struct GemmKernelSYCLGPTQInt4 {
   struct BufferB {
     uint32_t* qweight = nullptr;
     float* scales = nullptr;
+    int16_t* weight_sums = nullptr;
     int n = 0;
     int k = 0;
     int group_size = 128;
@@ -179,6 +189,7 @@ struct GemmKernelSYCLGPTQInt4 {
       if (owns_storage) {
         usm_free(qweight);
         usm_free(scales);
+        usm_free(weight_sums);
       }
     }
 
@@ -186,13 +197,15 @@ struct GemmKernelSYCLGPTQInt4 {
     size_t qweight_elements() const { return static_cast<size_t>(n) * k_packed; }
     size_t scale_elements() const { return static_cast<size_t>(n) * num_groups; }
 
-    void bind_view(uint32_t* qweight_pointer, float* scale_pointer) {
+    void bind_view(uint32_t* qweight_pointer, float* scale_pointer, int16_t* weight_sum_pointer) {
       if (owns_storage) {
         usm_free(qweight);
         usm_free(scales);
+        usm_free(weight_sums);
       }
       qweight = qweight_pointer;
       scales = scale_pointer;
+      weight_sums = weight_sum_pointer;
       owns_storage = false;
     }
 
@@ -202,6 +215,9 @@ struct GemmKernelSYCLGPTQInt4 {
       }
       if (scales == nullptr) {
         scales = usm_alloc<float>(scale_elements(), "GPTQ INT4 scales");
+      }
+      if (weight_sums == nullptr) {
+        weight_sums = usm_alloc<int16_t>(scale_elements(), "GPTQ INT4 weight sums");
       }
     }
 
@@ -218,6 +234,15 @@ struct GemmKernelSYCLGPTQInt4 {
         for (int group = 0; group < num_groups; ++group) {
           scales[static_cast<size_t>(output) * num_groups + group] =
               source_scales[static_cast<size_t>(group) * n + output];
+          int sum = 0;
+          const int packed_begin = group * (group_size / 8);
+          for (int packed_offset = 0; packed_offset < group_size / 8; ++packed_offset) {
+            const uint32_t word = qweight[static_cast<size_t>(output) * k_packed + packed_begin + packed_offset];
+            for (int nibble = 0; nibble < 8; ++nibble) {
+              sum += static_cast<int>((word >> (nibble * 4)) & 0x0fu) - 8;
+            }
+          }
+          weight_sums[static_cast<size_t>(output) * num_groups + group] = static_cast<int16_t>(sum);
         }
       }
     }
@@ -765,6 +790,11 @@ class SYCL_GPTQ_INT4_MOE_TP : public AVX2_MOE_BASE<T, SYCL_GPTQ_INT4_MOE_TP<T>> 
   SYCL_GPTQ_INT4_MOE_TP() = default;
   SYCL_GPTQ_INT4_MOE_TP(GeneralMOEConfig config, int tp_part_idx_ = 0) : Base(config, tp_part_idx_) {}
 
+  GeneralMOEConfig& mutable_config() { return config_; }
+  const std::shared_ptr<typename T::BufferB>& gate_weight(int expert) const { return gate_bb_[expert]; }
+  const std::shared_ptr<typename T::BufferB>& up_weight(int expert) const { return up_bb_[expert]; }
+  const std::shared_ptr<typename T::BufferB>& down_weight(int expert) const { return down_bb_[expert]; }
+
   void derived_init() {
     T::config();
     const int group_size = config_.quant_config.group_size;
@@ -900,8 +930,19 @@ class SYCL_GPTQ_INT4_MOE_TP : public AVX2_MOE_BASE<T, SYCL_GPTQ_INT4_MOE_TP<T>> 
     const int group_size = config_.quant_config.group_size;
     const uint64_t* physical_to_logical = reinterpret_cast<const uint64_t*>(config_.physical_to_logical_map);
     auto pool = config_.pool->get_subpool(tp_part_idx);
-    if (config_.gate_scale == nullptr) {
-      throw std::runtime_error("SYCL GPTQ INT4 requires scale tensors");
+    const bool per_expert = !config_.gate_projs.empty();
+    if (per_expert) {
+      const auto has_all_experts = [this](const auto& tensors) {
+        return !tensors.empty() && tensors[0].size() >= static_cast<size_t>(config_.expert_num);
+      };
+      if (!has_all_experts(config_.gate_projs) || !has_all_experts(config_.up_projs) ||
+          !has_all_experts(config_.down_projs) || !has_all_experts(config_.gate_scales) ||
+          !has_all_experts(config_.up_scales) || !has_all_experts(config_.down_scales)) {
+        throw std::runtime_error("SYCL GPTQ INT4 requires per-expert qweight and scale tensors");
+      }
+    } else if (config_.gate_proj == nullptr || config_.up_proj == nullptr || config_.down_proj == nullptr ||
+               config_.gate_scale == nullptr || config_.up_scale == nullptr || config_.down_scale == nullptr) {
+      throw std::runtime_error("SYCL GPTQ INT4 requires contiguous qweight and scale tensors");
     }
 
     prepare_contiguous_weights();
@@ -913,17 +954,25 @@ class SYCL_GPTQ_INT4_MOE_TP : public AVX2_MOE_BASE<T, SYCL_GPTQ_INT4_MOE_TP<T>> 
     int nth = T::recommended_nth(gate_up_n);
     pool->do_work_stealing_job(
         nth * config_.expert_num, nullptr,
-        [this, nth, physical_to_logical, gate_up_qweight_elements, gate_up_scale_elements](int task) {
+        [this, nth, physical_to_logical, per_expert, gate_up_qweight_elements, gate_up_scale_elements](int task) {
           const uint64_t expert = static_cast<uint64_t>(task / nth);
           const uint64_t logical = expert_map(physical_to_logical, expert);
           const int ith = task % nth;
           if (config_.should_skip_expert(logical)) return;
-          gate_bb_[expert]->from_mat(
-              reinterpret_cast<const uint32_t*>(config_.gate_proj) + logical * gate_up_qweight_elements,
-              reinterpret_cast<const float*>(config_.gate_scale) + logical * gate_up_scale_elements, ith, nth);
-          up_bb_[expert]->from_mat(
-              reinterpret_cast<const uint32_t*>(config_.up_proj) + logical * gate_up_qweight_elements,
-              reinterpret_cast<const float*>(config_.up_scale) + logical * gate_up_scale_elements, ith, nth);
+          const uint32_t* gate_qweight =
+              per_expert ? reinterpret_cast<const uint32_t*>(config_.gate_projs[0][logical])
+                         : reinterpret_cast<const uint32_t*>(config_.gate_proj) + logical * gate_up_qweight_elements;
+          const uint32_t* up_qweight =
+              per_expert ? reinterpret_cast<const uint32_t*>(config_.up_projs[0][logical])
+                         : reinterpret_cast<const uint32_t*>(config_.up_proj) + logical * gate_up_qweight_elements;
+          const float* gate_scale =
+              per_expert ? reinterpret_cast<const float*>(config_.gate_scales[0][logical])
+                         : reinterpret_cast<const float*>(config_.gate_scale) + logical * gate_up_scale_elements;
+          const float* up_scale =
+              per_expert ? reinterpret_cast<const float*>(config_.up_scales[0][logical])
+                         : reinterpret_cast<const float*>(config_.up_scale) + logical * gate_up_scale_elements;
+          gate_bb_[expert]->from_mat(gate_qweight, gate_scale, ith, nth);
+          up_bb_[expert]->from_mat(up_qweight, up_scale, ith, nth);
         },
         nullptr);
 
@@ -934,14 +983,18 @@ class SYCL_GPTQ_INT4_MOE_TP : public AVX2_MOE_BASE<T, SYCL_GPTQ_INT4_MOE_TP<T>> 
     nth = T::recommended_nth(down_n);
     pool->do_work_stealing_job(
         nth * config_.expert_num, nullptr,
-        [this, nth, physical_to_logical, down_qweight_elements, down_scale_elements](int task) {
+        [this, nth, physical_to_logical, per_expert, down_qweight_elements, down_scale_elements](int task) {
           const uint64_t expert = static_cast<uint64_t>(task / nth);
           const uint64_t logical = expert_map(physical_to_logical, expert);
           const int ith = task % nth;
           if (config_.should_skip_expert(logical)) return;
-          down_bb_[expert]->from_mat(
-              reinterpret_cast<const uint32_t*>(config_.down_proj) + logical * down_qweight_elements,
-              reinterpret_cast<const float*>(config_.down_scale) + logical * down_scale_elements, ith, nth);
+          const uint32_t* down_qweight =
+              per_expert ? reinterpret_cast<const uint32_t*>(config_.down_projs[0][logical])
+                         : reinterpret_cast<const uint32_t*>(config_.down_proj) + logical * down_qweight_elements;
+          const float* down_scale =
+              per_expert ? reinterpret_cast<const float*>(config_.down_scales[0][logical])
+                         : reinterpret_cast<const float*>(config_.down_scale) + logical * down_scale_elements;
+          down_bb_[expert]->from_mat(down_qweight, down_scale, ith, nth);
         },
         nullptr);
   }
@@ -1073,6 +1126,12 @@ class SYCL_GPTQ_INT4_MOE_TP : public AVX2_MOE_BASE<T, SYCL_GPTQ_INT4_MOE_TP<T>> 
       scratch->gate_scales = sycl_int4::usm_alloc<float>(experts * gate_up_scale_stride, "contiguous gate scales");
       scratch->up_scales = sycl_int4::usm_alloc<float>(experts * gate_up_scale_stride, "contiguous up scales");
       scratch->down_scales = sycl_int4::usm_alloc<float>(experts * down_scale_stride, "contiguous down scales");
+      scratch->gate_weight_sums =
+          sycl_int4::usm_alloc<int16_t>(experts * gate_up_scale_stride, "contiguous gate weight sums");
+      scratch->up_weight_sums =
+          sycl_int4::usm_alloc<int16_t>(experts * gate_up_scale_stride, "contiguous up weight sums");
+      scratch->down_weight_sums =
+          sycl_int4::usm_alloc<int16_t>(experts * down_scale_stride, "contiguous down weight sums");
     } catch (...) {
       scratch->reset_weights();
       throw;
@@ -1085,11 +1144,14 @@ class SYCL_GPTQ_INT4_MOE_TP : public AVX2_MOE_BASE<T, SYCL_GPTQ_INT4_MOE_TP<T>> 
 
     for (size_t expert = 0; expert < experts; ++expert) {
       gate_bb_[expert]->bind_view(scratch->gate_qweight + expert * gate_up_qweight_stride,
-                                  scratch->gate_scales + expert * gate_up_scale_stride);
+                                  scratch->gate_scales + expert * gate_up_scale_stride,
+                                  scratch->gate_weight_sums + expert * gate_up_scale_stride);
       up_bb_[expert]->bind_view(scratch->up_qweight + expert * gate_up_qweight_stride,
-                                scratch->up_scales + expert * gate_up_scale_stride);
+                                scratch->up_scales + expert * gate_up_scale_stride,
+                                scratch->up_weight_sums + expert * gate_up_scale_stride);
       down_bb_[expert]->bind_view(scratch->down_qweight + expert * down_qweight_stride,
-                                  scratch->down_scales + expert * down_scale_stride);
+                                  scratch->down_scales + expert * down_scale_stride,
+                                  scratch->down_weight_sums + expert * down_scale_stride);
     }
     scratch->weights_ready = true;
   }

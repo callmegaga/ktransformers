@@ -1,0 +1,16 @@
+{
+  "bootstrap_samples": 10000,
+  "candidate": "dynamic-v5",
+  "created_at": "2026-07-19T19:21:26.250877+08:00",
+  "inputs": {
+    "dynamic-v5": "/home/wy/Work/ktransformers/artifacts/running-server-bench/dynamic-v5-reprobe-ceiling-none-to-compute20-n5-20260719",
+    "igpu-fixed": "/home/wy/Work/ktransformers/artifacts/running-server-bench/igpu-fixed-engine-low-none-to-compute20-transition-token-exact-n5-20260719",
+    "packed-cpu-fixed": "/home/wy/Work/ktransformers/artifacts/running-server-bench/packed-cpu-fixed-engine-low-none-to-compute20-transition-token-exact-n5-20260719"
+  },
+  "sample_counts": {
+    "dynamic-v5": 5,
+    "igpu-fixed": 5,
+    "packed-cpu-fixed": 5
+  },
+  "seed": 20260719
+}

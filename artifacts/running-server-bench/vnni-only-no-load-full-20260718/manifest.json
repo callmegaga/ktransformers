@@ -1,0 +1,81 @@
+{
+  "arguments": {
+    "allow_estimated_usage": false,
+    "allow_short_output": false,
+    "base_url": "http://127.0.0.1:30100",
+    "bootstrap_samples": 2000,
+    "fail_fast": true,
+    "model": null,
+    "no_shuffle": false,
+    "output_dir": "artifacts/running-server-bench/vnni-only-no-load-full-20260718",
+    "repetitions": 5,
+    "run_label": "vnni-only__no-load__full",
+    "seed": 20260718,
+    "server_wait_timeout": 30.0,
+    "timeout": 900.0,
+    "warmup_output_tokens": 8,
+    "warmup_prompt_tokens": 256,
+    "warmups": 15,
+    "workloads": [
+      {
+        "output_tokens": 300,
+        "target_prompt_tokens": 1
+      },
+      {
+        "output_tokens": 300,
+        "target_prompt_tokens": 1024
+      },
+      {
+        "output_tokens": 300,
+        "target_prompt_tokens": 2048
+      },
+      {
+        "output_tokens": 300,
+        "target_prompt_tokens": 4096
+      },
+      {
+        "output_tokens": 300,
+        "target_prompt_tokens": 8192
+      }
+    ]
+  },
+  "error": null,
+  "expected_sample_count": 25,
+  "finished_at": "2026-07-18T12:17:46.350961+08:00",
+  "run_label": "vnni-only__no-load__full",
+  "sample_count": 25,
+  "server": {
+    "base_url": "http://127.0.0.1:30100",
+    "model": "Qwen3.5-35B-A3B-GPTQ-Int4"
+  },
+  "started_at": "2026-07-18T12:06:02.667785+08:00",
+  "status": "complete",
+  "successful_sample_count": 25,
+  "workloads": [
+    {
+      "label": "p1-o300",
+      "output_tokens": 300,
+      "target_prompt_tokens": 1
+    },
+    {
+      "label": "p1024-o300",
+      "output_tokens": 300,
+      "target_prompt_tokens": 1024
+    },
+    {
+      "label": "p2048-o300",
+      "output_tokens": 300,
+      "target_prompt_tokens": 2048
+    },
+    {
+      "label": "p4096-o300",
+      "output_tokens": 300,
+      "target_prompt_tokens": 4096
+    },
+    {
+      "label": "p8192-o300",
+      "output_tokens": 300,
+      "target_prompt_tokens": 8192
+    }
+  ]
+}

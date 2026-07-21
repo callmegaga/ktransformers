@@ -1,0 +1,17 @@
+{
+  "bootstrap_samples": 5000,
+  "created_at": "2026-07-19T16:49:41.820669+08:00",
+  "cycle_count": 5,
+  "direction": "low-to-high",
+  "exact_token_timestamp_cycles": 5,
+  "inputs": [
+    "/home/wy/Work/ktransformers/artifacts/running-server-bench/dynamic-v4-cal32-load-context-engine-low-none-to-compute20-transition-token-exact-smoke-20260719",
+    "/home/wy/Work/ktransformers/artifacts/running-server-bench/dynamic-v4-cal32-load-context-engine-low-none-to-compute20-transition-token-exact-cycle02-20260719",
+    "/home/wy/Work/ktransformers/artifacts/running-server-bench/dynamic-v4-cal32-load-context-engine-low-none-to-compute20-transition-token-exact-cycle03-20260719",
+    "/home/wy/Work/ktransformers/artifacts/running-server-bench/dynamic-v4-cal32-load-context-engine-low-none-to-compute20-transition-token-exact-cycle04-20260719",
+    "/home/wy/Work/ktransformers/artifacts/running-server-bench/dynamic-v4-cal32-load-context-engine-low-none-to-compute20-transition-token-exact-cycle05-20260719"
+  ],
+  "output_dir": "artifacts/running-server-bench/dynamic-v4-cal32-load-context-none-to-compute20-n5-diagnostic-20260719",
+  "seed": 20260719,
+  "target": "igpu"
+}

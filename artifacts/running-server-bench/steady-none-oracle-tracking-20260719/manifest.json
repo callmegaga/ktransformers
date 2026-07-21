@@ -1,0 +1,30 @@
+{
+  "block_counts": {
+    "dynamic-v5": 1,
+    "packed-cpu-fixed": 1,
+    "phase-fixed": 1
+  },
+  "bootstrap_samples": 20000,
+  "candidate": "dynamic-v5",
+  "created_at": "2026-07-19T21:40:58.110535+08:00",
+  "inputs": [
+    {
+      "artifact": "/home/wy/Work/ktransformers/artifacts/running-server-bench/dynamic-v5-engine-low-none-steady-no-telemetry-e-n5-20260719",
+      "strategy": "dynamic-v5"
+    },
+    {
+      "artifact": "/home/wy/Work/ktransformers/artifacts/running-server-bench/phase-fixed-engine-low-none-steady-f-n5-20260719",
+      "strategy": "phase-fixed"
+    },
+    {
+      "artifact": "/home/wy/Work/ktransformers/artifacts/running-server-bench/packed-cpu-fixed-engine-low-none-steady-g-n5-20260719",
+      "strategy": "packed-cpu-fixed"
+    }
+  ],
+  "sample_counts": {
+    "dynamic-v5": 5,
+    "packed-cpu-fixed": 5,
+    "phase-fixed": 5
+  },
+  "seed": 20260719
+}

@@ -1,0 +1,332 @@
+{
+  "arguments": {
+    "backends": [
+      {
+        "method": "GPTQ_INT4",
+        "name": "vnni-only",
+        "requires_oneapi": false
+      },
+      {
+        "method": "CPU_IGPU_GPTQ_INT4",
+        "name": "vnni-sycl-dynamic",
+        "requires_oneapi": true
+      }
+    ],
+    "bootstrap_samples": 2000,
+    "chunked_prefill_size": 4096,
+    "cpuinfer_threads": 8,
+    "dry_run": false,
+    "fail_fast": false,
+    "kt_kernel_package_root": "/home/wy/Work/ktransformers/kt-kernel/build/lib.linux-x86_64-cpython-311",
+    "load_cpus": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+    ],
+    "load_warmup_seconds": 1.0,
+    "loads": [
+      {
+        "kind": "none",
+        "workers": 0
+      },
+      {
+        "kind": "compute",
+        "workers": 8
+      }
+    ],
+    "memory_mib_per_buffer": 64,
+    "model": "/home/wy/Work/models/Qwen3.5-35B-A3B-GPTQ-Int4",
+    "num_gpu_experts": 24,
+    "oneapi_device_selector": "level_zero:gpu",
+    "oneapi_setvars": "/opt/intel/oneapi/setvars.sh",
+    "output_dir": "artifacts/cpu-igpu-e2e/smoke-final-20260717",
+    "port": 30100,
+    "python_path": "/home/wy/miniconda3/bin/python",
+    "request_repetitions": 1,
+    "request_timeout": 900.0,
+    "scenario_cooldown_seconds": 1.0,
+    "scenario_warmups": 3,
+    "seed": 20260717,
+    "served_name": "Qwen3.5-35B-A3B-GPTQ-Int4",
+    "server_arg": [],
+    "server_repetitions": 1,
+    "show_server_log": false,
+    "startup_timeout": 900.0,
+    "threadpool_count": 1,
+    "warmup_output_tokens": 8,
+    "warmup_prompt_tokens": 256,
+    "weight_path": "/home/wy/Work/models/Qwen3.5-35B-A3B-GPTQ-Int4",
+    "workloads": [
+      {
+        "output_tokens": 8,
+        "prompt_tokens": 1
+      },
+      {
+        "output_tokens": 8,
+        "prompt_tokens": 1024
+      }
+    ]
+  },
+  "backends": [
+    {
+      "method": "GPTQ_INT4",
+      "name": "vnni-only",
+      "requires_oneapi": false
+    },
+    {
+      "method": "CPU_IGPU_GPTQ_INT4",
+      "name": "vnni-sycl-dynamic",
+      "requires_oneapi": true
+    }
+  ],
+  "finished_at": "2026-07-17T17:13:42.325834+08:00",
+  "git": {
+    "commit": "8f5e2884548ee654db5d396bb6139af0d9a20fab",
+    "dirty": true,
+    "dirty_files": [
+      " M kt-kernel/cpu_backend/worker_pool.cpp",
+      " M kt-kernel/cpu_backend/worker_pool.h",
+      " M kt-kernel/ext_bindings.cpp",
+      " M kt-kernel/operators/avx2/moe_base.hpp",
+      " M kt-kernel/operators/common.hpp",
+      " M kt-kernel/operators/sycl/gptq_int4_sycl-moe.hpp",
+      " M kt-kernel/python/experts.py",
+      " M kt-kernel/python/utils/amx.py",
+      " M kt-kernel/test/per_commit/test_moe_gptq_int4_accuracy.py",
+      "?? artifacts/",
+      "?? doc/zh/CPU-iGPU-MoE-Dynamic-Scheduling-Development-Log_zh.md",
+      "?? kt-kernel/bench/bench_cpu_igpu_e2e.py",
+      "?? kt-kernel/bench/bench_gptq_int4_backends.py",
+      "?? kt-kernel/bench/cpu_background_load.py",
+      "?? kt-kernel/operators/avx2/gptq_int4_packed_avxvnni-moe.hpp",
+      "?? kt-kernel/operators/cpu_load_monitor.hpp",
+      "?? kt-kernel/operators/sycl/gptq_int4_cpu_igpu-moe.hpp",
+      "?? kt-kernel/test/test_cpu_igpu_e2e_bench.py",
+      "?? perf-log/",
+      "?? report/"
+    ]
+  },
+  "hardware": {
+    "cpu_count": 20,
+    "lscpu_json": "{\n   \"lscpu\": [\n      {\n         \"field\": \"Architecture:\",\n         \"data\": \"x86_64\"\n      },{\n         \"field\": \"CPU op-mode(s):\",\n         \"data\": \"32-bit, 64-bit\"\n      },{\n         \"field\": \"Address sizes:\",\n         \"data\": \"46 bits physical, 48 bits virtual\"\n      },{\n         \"field\": \"Byte Order:\",\n         \"data\": \"Little Endian\"\n      },{\n         \"field\": \"CPU(s):\",\n         \"data\": \"20\"\n      },{\n         \"field\": \"On-line CPU(s) list:\",\n         \"data\": \"0-19\"\n      },{\n         \"field\": \"Vendor ID:\",\n         \"data\": \"GenuineIntel\"\n      },{\n         \"field\": \"Model name:\",\n         \"data\": \"Intel(R) Core(TM) Ultra 7 265K\"\n      },{\n         \"field\": \"CPU family:\",\n         \"data\": \"6\"\n      },{\n         \"field\": \"Model:\",\n         \"data\": \"198\"\n      },{\n         \"field\": \"Thread(s) per core:\",\n         \"data\": \"1\"\n      },{\n         \"field\": \"Core(s) per socket:\",\n         \"data\": \"20\"\n      },{\n         \"field\": \"Socket(s):\",\n         \"data\": \"1\"\n      },{\n         \"field\": \"Stepping:\",\n         \"data\": \"2\"\n      },{\n         \"field\": \"CPU(s) scaling MHz:\",\n         \"data\": \"63%\"\n      },{\n         \"field\": \"CPU max MHz:\",\n         \"data\": \"5600.0000\"\n      },{\n         \"field\": \"CPU min MHz:\",\n         \"data\": \"800.0000\"\n      },{\n         \"field\": \"BogoMIPS:\",\n         \"data\": \"7756.80\"\n      },{\n         \"field\": \"Flags:\",\n         \"data\": \"fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush dts acpi mmx fxsr sse sse2 ss ht tm pbe syscall nx pdpe1gb rdtscp lm constant_tsc art arch_perfmon pebs bts rep_good nopl xtopology nonstop_tsc cpuid aperfmperf tsc_known_freq pni pclmulqdq dtes64 monitor ds_cpl vmx smx est tm2 ssse3 sdbg fma cx16 xtpr pdcm pcid sse4_1 sse4_2 x2apic movbe popcnt tsc_deadline_timer aes xsave avx f16c rdrand lahf_lm abm 3dnowprefetch cpuid_fault ssbd ibrs ibpb stibp ibrs_enhanced tpr_shadow flexpriority ept vpid ept_ad fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid rdt_a rdseed adx smap clflushopt clwb intel_pt sha_ni xsaveopt xsavec xgetbv1 xsaves split_lock_detect user_shstk avx_vnni lam wbnoinvd dtherm ida arat pln pts hwp hwp_notify hwp_act_window hwp_epp hwp_pkg_req hfi vnmi umip pku ospke waitpkg gfni vaes vpclmulqdq rdpid bus_lock_detect movdiri movdir64b fsrm md_clear serialize arch_lbr ibt flush_l1d arch_capabilities\"\n      },{\n         \"field\": \"Virtualization:\",\n         \"data\": \"VT-x\"\n      },{\n         \"field\": \"L1d cache:\",\n         \"data\": \"704 KiB (18 instances)\"\n      },{\n         \"field\": \"L1i cache:\",\n         \"data\": \"1.1 MiB (18 instances)\"\n      },{\n         \"field\": \"L2 cache:\",\n         \"data\": \"36 MiB (11 instances)\"\n      },{\n         \"field\": \"L3 cache:\",\n         \"data\": \"30 MiB (1 instance)\"\n      },{\n         \"field\": \"NUMA node(s):\",\n         \"data\": \"1\"\n      },{\n         \"field\": \"NUMA node0 CPU(s):\",\n         \"data\": \"0-19\"\n      },{\n         \"field\": \"Vulnerability Gather data sampling:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Ghostwrite:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Indirect target selection:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Itlb multihit:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability L1tf:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Mds:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Meltdown:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Mmio stale data:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Old microcode:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Reg file data sampling:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Retbleed:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Spec rstack overflow:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Spec store bypass:\",\n         \"data\": \"Mitigation; Speculative Store Bypass disabled via prctl\"\n      },{\n         \"field\": \"Vulnerability Spectre v1:\",\n         \"data\": \"Mitigation; usercopy/swapgs barriers and __user pointer sanitization\"\n      },{\n         \"field\": \"Vulnerability Spectre v2:\",\n         \"data\": \"Mitigation; Enhanced / Automatic IBRS; IBPB conditional; PBRSB-eIBRS Not affected; BHI BHI_DIS_S\"\n      },{\n         \"field\": \"Vulnerability Srbds:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Tsa:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Tsx async abort:\",\n         \"data\": \"Not affected\"\n      },{\n         \"field\": \"Vulnerability Vmscape:\",\n         \"data\": \"Mitigation; IBPB before exit to userspace\"\n      }\n   ]\n}",
+    "memory_total_kib": 48648032,
+    "nvidia_smi": "NVIDIA GeForce RTX 4060 Ti, 16380 MiB, 580.159.03",
+    "platform": "Linux-7.0.0-28-generic-x86_64-with-glibc2.39",
+    "python": "3.11.14",
+    "sycl_ls": null
+  },
+  "loads": [
+    {
+      "kind": "none",
+      "label": "none",
+      "workers": 0
+    },
+    {
+      "kind": "compute",
+      "label": "compute-8",
+      "workers": 8
+    }
+  ],
+  "outputs": {
+    "comparisons": "comparisons.csv",
+    "report": "report.md",
+    "samples": "samples.jsonl",
+    "summary": "summary.csv"
+  },
+  "runtime": {
+    "cpu_variant": "avx2",
+    "extension_file": "/home/wy/Work/ktransformers/kt-kernel/build/lib.linux-x86_64-cpython-311/kt_kernel/kt_kernel_ext.cpython-311-x86_64-linux-gnu.so",
+    "has_cpu_igpu_gptq_int4": true,
+    "package_file": "/home/wy/Work/ktransformers/kt-kernel/build/lib.linux-x86_64-cpython-311/kt_kernel/__init__.py"
+  },
+  "sample_count": 8,
+  "scenario_runs": [
+    {
+      "backend": "vnni-only",
+      "finished_at": "2026-07-17T17:11:29.876692+08:00",
+      "load": "compute-8",
+      "name": "server-00-vnni-only-compute-8",
+      "request_error_count": 0,
+      "server_memory_peak_kib": {
+        "pss_kib": 36322855,
+        "rss_kib": 45205640
+      },
+      "started_at": "2026-07-17T17:10:45.565389+08:00",
+      "status": "ok"
+    },
+    {
+      "backend": "vnni-only",
+      "finished_at": "2026-07-17T17:11:42.909220+08:00",
+      "load": "none",
+      "name": "server-00-vnni-only-none",
+      "request_error_count": 0,
+      "server_memory_peak_kib": {
+        "pss_kib": 36330358,
+        "rss_kib": 45211064
+      },
+      "started_at": "2026-07-17T17:11:30.877263+08:00",
+      "status": "ok"
+    },
+    {
+      "backend": "vnni-sycl-dynamic",
+      "finished_at": "2026-07-17T17:13:25.997278+08:00",
+      "load": "compute-8",
+      "name": "server-00-vnni-sycl-dynamic-compute-8",
+      "request_error_count": 0,
+      "server_memory_peak_kib": {
+        "pss_kib": 6379039,
+        "rss_kib": 15265820
+      },
+      "started_at": "2026-07-17T17:13:00.709950+08:00",
+      "status": "ok"
+    },
+    {
+      "backend": "vnni-sycl-dynamic",
+      "finished_at": "2026-07-17T17:13:40.730009+08:00",
+      "load": "none",
+      "name": "server-00-vnni-sycl-dynamic-none",
+      "request_error_count": 0,
+      "server_memory_peak_kib": {
+        "pss_kib": 6279493,
+        "rss_kib": 14838120
+      },
+      "started_at": "2026-07-17T17:13:26.998507+08:00",
+      "status": "ok"
+    }
+  ],
+  "server_runs": [
+    {
+      "backend": "vnni-only",
+      "command": [
+        "/home/wy/miniconda3/bin/python",
+        "-m",
+        "sglang.launch_server",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "30100",
+        "--model",
+        "/home/wy/Work/models/Qwen3.5-35B-A3B-GPTQ-Int4",
+        "--served-model-name",
+        "Qwen3.5-35B-A3B-GPTQ-Int4",
+        "--kt-weight-path",
+        "/home/wy/Work/models/Qwen3.5-35B-A3B-GPTQ-Int4",
+        "--kt-cpuinfer",
+        "8",
+        "--kt-threadpool-count",
+        "1",
+        "--kt-num-gpu-experts",
+        "24",
+        "--attention-backend",
+        "triton",
+        "--trust-remote-code",
+        "--mem-fraction-static",
+        "0.85",
+        "--chunked-prefill-size",
+        "4096",
+        "--max-running-requests",
+        "1",
+        "--max-total-tokens",
+        "32000",
+        "--enable-mixed-chunk",
+        "--tensor-parallel-size",
+        "1",
+        "--disable-shared-experts-fusion",
+        "--disable-radix-cache",
+        "--disable-cuda-graph",
+        "--dtype",
+        "float16",
+        "--kt-method",
+        "GPTQ_INT4"
+      ],
+      "environment": {
+        "KT_AVXVNNI_FUSED_MOE": "1",
+        "KT_GPTQ_INT4_BACKEND": "avxvnni"
+      },
+      "finished_at": "2026-07-17T17:11:44.086707+08:00",
+      "log": "logs/server-00-vnni-only.log",
+      "name": "server-00-vnni-only",
+      "port": 30100,
+      "server_repetition": 0,
+      "started_at": "2026-07-17T17:09:07.610208+08:00",
+      "status": "ok"
+    },
+    {
+      "backend": "vnni-sycl-dynamic",
+      "command": [
+        "/home/wy/miniconda3/bin/python",
+        "-m",
+        "sglang.launch_server",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "30101",
+        "--model",
+        "/home/wy/Work/models/Qwen3.5-35B-A3B-GPTQ-Int4",
+        "--served-model-name",
+        "Qwen3.5-35B-A3B-GPTQ-Int4",
+        "--kt-weight-path",
+        "/home/wy/Work/models/Qwen3.5-35B-A3B-GPTQ-Int4",
+        "--kt-cpuinfer",
+        "8",
+        "--kt-threadpool-count",
+        "1",
+        "--kt-num-gpu-experts",
+        "24",
+        "--attention-backend",
+        "triton",
+        "--trust-remote-code",
+        "--mem-fraction-static",
+        "0.85",
+        "--chunked-prefill-size",
+        "4096",
+        "--max-running-requests",
+        "1",
+        "--max-total-tokens",
+        "32000",
+        "--enable-mixed-chunk",
+        "--tensor-parallel-size",
+        "1",
+        "--disable-shared-experts-fusion",
+        "--disable-radix-cache",
+        "--disable-cuda-graph",
+        "--dtype",
+        "float16",
+        "--kt-method",
+        "CPU_IGPU_GPTQ_INT4"
+      ],
+      "environment": {
+        "KT_CPU_IGPU_POLICY": "dynamic",
+        "KT_CPU_IGPU_RATIO": "0",
+        "ONEAPI_DEVICE_SELECTOR": "level_zero:gpu"
+      },
+      "finished_at": "2026-07-17T17:13:42.311485+08:00",
+      "log": "logs/server-00-vnni-sycl-dynamic.log",
+      "name": "server-00-vnni-sycl-dynamic",
+      "port": 30101,
+      "server_repetition": 0,
+      "started_at": "2026-07-17T17:11:44.089804+08:00",
+      "status": "ok"
+    }
+  ],
+  "started_at": "2026-07-17T17:09:07.533225+08:00",
+  "status": "complete",
+  "successful_sample_count": 8,
+  "workloads": [
+    {
+      "label": "p1-o8",
+      "output_tokens": 8,
+      "prompt_tokens": 1
+    },
+    {
+      "label": "p1024-o8",
+      "output_tokens": 8,
+      "prompt_tokens": 1024
+    }
+  ]
+}

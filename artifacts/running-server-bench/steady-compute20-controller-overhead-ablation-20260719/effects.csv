@@ -1,0 +1,16 @@
+candidate,baseline,metric,unit,effect,effect_pct,ci95_low,ci95_high
+dynamic-v5,igpu-fixed,prefill_tps,token/s,improvement,83.84430491031488,68.44171130154442,102.99734793162233
+dynamic-v5,igpu-fixed,decode_tps,token/s,improvement,22.52295807978686,14.732368126359129,30.237908382341637
+dynamic-v5,igpu-fixed,ttft_ms,ms,reduction,45.97136988885669,40.61491286742971,50.80415354828405
+dynamic-v5,igpu-fixed,tpot_ms,ms/token,reduction,18.18891997642178,12.83429518363443,23.132524924125185
+dynamic-v5,igpu-fixed,e2e_ms,ms,reduction,24.639272881461917,19.561766077003035,29.361171161297683
+dynamic-v5,dynamic-v5-telemetry,prefill_tps,token/s,improvement,-2.2844322476038736,-6.011099047211987,1.6346570664873994
+dynamic-v5,dynamic-v5-telemetry,decode_tps,token/s,improvement,5.941059274539939,-0.8429987684200276,12.76077570407299
+dynamic-v5,dynamic-v5-telemetry,ttft_ms,ms,reduction,-2.1934602344714893,-6.252023944134666,1.6583475956566067
+dynamic-v5,dynamic-v5-telemetry,tpot_ms,ms/token,reduction,5.34959142787319,-0.9461063565731491,11.19764818839638
+dynamic-v5,dynamic-v5-telemetry,e2e_ms,ms,reduction,4.1722761425837085,-1.3941724579394998,9.615880383783848
+dynamic-v5,phase-fixed,prefill_tps,token/s,improvement,-1.180437806867285,-3.1069887865150467,0.9088261605398209
+dynamic-v5,phase-fixed,decode_tps,token/s,improvement,-0.22486481721571971,-8.032556366595141,8.097839564885925
+dynamic-v5,phase-fixed,ttft_ms,ms,reduction,-1.1999522218137493,-3.228432187910258,0.8741422580554326
+dynamic-v5,phase-fixed,tpot_ms,ms/token,reduction,-0.20837989628683662,-8.778680958166914,7.398076671232584
+dynamic-v5,phase-fixed,e2e_ms,ms,reduction,-0.37206338599875544,-7.384590194334708,6.004940540088743

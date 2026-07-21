@@ -1,0 +1,74 @@
+{
+  "arguments": {
+    "allow_estimated_usage": false,
+    "allow_short_output": false,
+    "base_url": "http://127.0.0.1:30100",
+    "bootstrap_samples": 500,
+    "disable_cpu_telemetry": false,
+    "fail_fast": true,
+    "model": null,
+    "no_shuffle": false,
+    "output_dir": "artifacts/running-server-bench/dynamic-v3-stable-engine-low-compute20-to-none-transition-cycle03-20260719",
+    "repetitions": 1,
+    "run_label": "dynamic-v3-stable__engine-low__compute20-to-none__transition-cycle03",
+    "scheduler_telemetry_file": "artifacts/server-telemetry/dynamic-v3-stable-compute20.jsonl",
+    "seed": 20260719,
+    "server_wait_timeout": 30.0,
+    "stop_background_after_output_tokens": 150,
+    "stop_background_pid": 788925,
+    "timeout": 900.0,
+    "warmup_output_tokens": 8,
+    "warmup_prompt_tokens": 256,
+    "warmups": 15,
+    "workloads": [
+      {
+        "output_tokens": 600,
+        "target_prompt_tokens": 1024
+      }
+    ]
+  },
+  "background_transition": {
+    "command": "python kt-kernel/bench/cpu_background_load.py --kind compute --workers 20 --affinity free --nice 0",
+    "pid": 788925,
+    "result": {
+      "background_stop_output_token": 150,
+      "background_stopped": true,
+      "transition_decode_calls_after_signal": 450,
+      "transition_decode_calls_before_signal": 150,
+      "transition_final_igpu_ratio": 0.0,
+      "transition_final_policy_igpu_ratio": 0.0,
+      "transition_first_cpu_execution_delay_calls": 6,
+      "transition_first_cpu_execution_delay_ms": 317.554517,
+      "transition_first_cpu_execution_sequence": 2821,
+      "transition_settled_cpu_delay_calls": 38,
+      "transition_settled_cpu_delay_ms": 1419.130525,
+      "transition_settled_cpu_sequence": 2853
+    },
+    "stop_after_output_tokens": 150
+  },
+  "error": null,
+  "expected_sample_count": 1,
+  "finished_at": "2026-07-19T11:34:25.874183+08:00",
+  "run_label": "dynamic-v3-stable__engine-low__compute20-to-none__transition-cycle03",
+  "sample_count": 1,
+  "server": {
+    "base_url": "http://127.0.0.1:30100",
+    "model": "Qwen3.5-35B-A3B-GPTQ-Int4"
+  },
+  "started_at": "2026-07-19T11:33:14.475208+08:00",
+  "status": "complete",
+  "successful_sample_count": 1,
+  "telemetry": {
+    "cpu_enabled": true,
+    "scheduler_event_count": 601,
+    "scheduler_events_file": "scheduler-telemetry.jsonl",
+    "scheduler_source": "/home/wy/Work/ktransformers/artifacts/server-telemetry/dynamic-v3-stable-compute20.jsonl"
+  },
+  "workloads": [
+    {
+      "label": "p1024-o600",
+      "output_tokens": 600,
+      "target_prompt_tokens": 1024
+    }
+  ]
+}

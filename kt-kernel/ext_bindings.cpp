@@ -60,12 +60,14 @@ static const bool _is_plain_ = false;
 #include "operators/avx2/fp8-moe.hpp"
 #include "operators/avx2/gptq_int4-moe.hpp"
 #include "operators/avx2/gptq_int4_avxvnni-moe.hpp"
+#include "operators/avx2/gptq_int4_packed_avxvnni-moe.hpp"
 #include "operators/avx2/mxfp4-moe.hpp"
 #include "operators/avx2/mxfp8-moe.hpp"
 #include "operators/avx2/rawint4-moe.hpp"
 #include "operators/avx2/rawint4_avxvnni-moe.hpp"
 #endif
 #if defined(USE_SYCL)
+#include "operators/sycl/gptq_int4_cpu_igpu-moe.hpp"
 #include "operators/sycl/gptq_int4_sycl-moe.hpp"
 #endif
 
@@ -436,6 +438,13 @@ void bind_moe_module(py::module_& moe_module, const char* name) {
       .def("load_weights", &MoeClass::load_weights)
       .def("forward", &MoeClass::forward_binding);
 
+  if constexpr (requires(MoeClass& moe) { moe.scheduler_igpu_ratio(); }) {
+    moe_cls.def("scheduler_igpu_ratio", &MoeClass::scheduler_igpu_ratio)
+        .def("scheduler_cpu_load", &MoeClass::scheduler_cpu_load)
+        .def("scheduler_debug", &MoeClass::scheduler_debug)
+        .def("scheduler_execution_debug", &MoeClass::scheduler_execution_debug);
+  }
+
   // Bind write_weight_scale_to_buffer_task for MoE types that support it
   // Uses SFINAE to detect if MoeClass has write_weight_scale_to_buffer method
   if constexpr (requires { &MoeClass::write_weight_scale_to_buffer; }) {
@@ -483,7 +492,11 @@ void bind_moe_module(py::module_& moe_module, const char* name) {
 }
 
 PYBIND11_MODULE(kt_kernel_ext, m) {
-  py::class_<WorkerPool>(m, "WorkerPool").def(py::init<int>());
+  py::class_<WorkerPool>(m, "WorkerPool")
+      .def(py::init<int>())
+      .def("get_thread_num", &WorkerPool::get_thread_num)
+      .def("get_bound_cpu_ids", &WorkerPool::get_bound_cpu_ids)
+      .def("set_restricted_worker_count", &WorkerPool::set_restricted_worker_count);
   py::class_<WorkerPoolConfig>(m, "WorkerPoolConfig")
       .def(py::init<>())
       .def_readwrite("subpool_count", &WorkerPoolConfig::subpool_count)
@@ -766,6 +779,27 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
       // V4-Flash 2604B SwiGLU clamp limit (0.0 = disabled). See common.hpp.
       .def_readwrite("swiglu_limit", &GeneralMOEConfig::swiglu_limit)
       .def_readwrite("swiglu_alpha", &GeneralMOEConfig::swiglu_alpha)
+      .def_readwrite("cpu_igpu_igpu_ratio", &GeneralMOEConfig::cpu_igpu_igpu_ratio)
+      .def_readwrite("cpu_igpu_prefill_ratio", &GeneralMOEConfig::cpu_igpu_prefill_ratio)
+      .def_readwrite("cpu_igpu_decode_ratio", &GeneralMOEConfig::cpu_igpu_decode_ratio)
+      .def_readwrite("cpu_igpu_dynamic", &GeneralMOEConfig::cpu_igpu_dynamic)
+      .def_readwrite("cpu_igpu_decode_load_low", &GeneralMOEConfig::cpu_igpu_decode_load_low)
+      .def_readwrite("cpu_igpu_decode_load_high", &GeneralMOEConfig::cpu_igpu_decode_load_high)
+      .def_readwrite("cpu_igpu_prefill_load_low", &GeneralMOEConfig::cpu_igpu_prefill_load_low)
+      .def_readwrite("cpu_igpu_prefill_load_high", &GeneralMOEConfig::cpu_igpu_prefill_load_high)
+      .def_readwrite("cpu_igpu_load_ewma_alpha", &GeneralMOEConfig::cpu_igpu_load_ewma_alpha)
+      .def_readwrite("cpu_igpu_cost_ewma_alpha", &GeneralMOEConfig::cpu_igpu_cost_ewma_alpha)
+      .def_readwrite("cpu_igpu_decode_switch_margin", &GeneralMOEConfig::cpu_igpu_decode_switch_margin)
+      .def_readwrite("cpu_igpu_decode_cost_load_match_delta",
+                     &GeneralMOEConfig::cpu_igpu_decode_cost_load_match_delta)
+      .def_readwrite("cpu_igpu_decode_load_reprobe_delta", &GeneralMOEConfig::cpu_igpu_decode_load_reprobe_delta)
+      .def_readwrite("cpu_igpu_load_sample_ms", &GeneralMOEConfig::cpu_igpu_load_sample_ms)
+      .def_readwrite("cpu_igpu_decode_min_dwell", &GeneralMOEConfig::cpu_igpu_decode_min_dwell)
+      .def_readwrite("cpu_igpu_prefill_min_dwell", &GeneralMOEConfig::cpu_igpu_prefill_min_dwell)
+      .def_readwrite("cpu_igpu_decode_calibration_samples", &GeneralMOEConfig::cpu_igpu_decode_calibration_samples)
+      .def_readwrite("cpu_igpu_decode_load_reprobe_grace", &GeneralMOEConfig::cpu_igpu_decode_load_reprobe_grace)
+      .def_readwrite("cpu_igpu_decode_reprobe_samples", &GeneralMOEConfig::cpu_igpu_decode_reprobe_samples)
+      .def_readwrite("cpu_igpu_decode_reprobe_interval", &GeneralMOEConfig::cpu_igpu_decode_reprobe_interval)
 
       ;
 
@@ -833,11 +867,14 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
   bind_moe_module<AVX2_MXFP8_MOE_TP<avx2::GemmKernelAVX2MXFP8>>(moe_module, "AVX2MXFP8_MOE");
   bind_moe_module<AVXVNNI256_GPTQ_INT4_MOE_TP<avxvnni::GemmKernelAVXVNNI256GPTQInt4>>(moe_module,
                                                                                       "AVXVNNI256GPTQInt4_MOE");
+  bind_moe_module<AVXVNNI256_PACKED_GPTQ_INT4_MOE_TP<avxvnni_packed::GemmKernelAVXVNNI256PackedGPTQInt4>>(
+      moe_module, "AVXVNNI256PackedGPTQInt4_MOE");
   bind_moe_module<AVXVNNI256_RAW_INT4_MOE_TP<avxvnni_rawint4::GemmKernelAVXVNNI256RawInt4>>(moe_module,
                                                                                             "AVXVNNI256RawInt4_MOE");
 #endif
 #if defined(USE_SYCL)
   bind_moe_module<SYCL_GPTQ_INT4_MOE_TP<sycl_int4::GemmKernelSYCLGPTQInt4>>(moe_module, "SYCLGPTQInt4_MOE");
+  bind_moe_module<CPU_IGPU_GPTQ_INT4_MOE_PART>(moe_module, "CPUiGPUGPTQInt4_MOE");
 #endif
 
 #if defined(USE_MOE_KERNEL)

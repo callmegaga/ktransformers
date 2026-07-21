@@ -1,0 +1,15 @@
+candidate,baseline,metric,unit,effect,effect_pct,ci95_low,ci95_high
+dynamic-v5,packed-cpu-fixed,prefill_tps,token/s,improvement,-0.5581289353416063,-2.5660673051259186,0.6945086251480381
+dynamic-v5,packed-cpu-fixed,decode_tps,token/s,improvement,95.88576964533779,79.54451821077966,112.1835055313173
+dynamic-v5,packed-cpu-fixed,ttft_ms,ms,reduction,-0.5999456917345158,-2.7304003795189047,0.6699091495201034
+dynamic-v5,packed-cpu-fixed,tpot_ms,ms/token,reduction,49.26455055816831,44.75766891312092,52.998609464950846
+dynamic-v5,packed-cpu-fixed,e2e_ms,ms,reduction,45.14928613478546,40.60582450737614,48.86731514882945
+dynamic-v5,packed-cpu-fixed,client_pre_transition_tps,token/s,improvement,-0.8924320820490883,-2.033505861115159,0.18212829487114224
+dynamic-v5,packed-cpu-fixed,client_post_transition_tps,token/s,improvement,112.57604501492442,94.29650119206914,131.75303510427443
+dynamic-v5,igpu-fixed,prefill_tps,token/s,improvement,102.12866139089454,91.7856208387568,111.64764568116868
+dynamic-v5,igpu-fixed,decode_tps,token/s,improvement,23.555809217159517,17.73414964145228,29.468478795967428
+dynamic-v5,igpu-fixed,ttft_ms,ms,reduction,50.64896272699247,47.92013627670006,52.76491134169114
+dynamic-v5,igpu-fixed,tpot_ms,ms/token,reduction,19.08580992290061,15.104719551331259,22.76613820963899
+dynamic-v5,igpu-fixed,e2e_ms,ms,reduction,26.23095263377262,23.41409699567322,28.971718875129817
+dynamic-v5,igpu-fixed,client_pre_transition_tps,token/s,improvement,77.51065155734238,68.88309217440789,90.1788250593726
+dynamic-v5,igpu-fixed,client_post_transition_tps,token/s,improvement,13.943423203353555,7.685650483956485,21.0256152490333

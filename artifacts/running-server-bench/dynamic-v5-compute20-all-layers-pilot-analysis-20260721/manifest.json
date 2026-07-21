@@ -1,0 +1,9 @@
+{
+  "artifact": "/home/wy/Work/ktransformers/artifacts/running-server-bench/dynamic-v5-engine-low-compute20-all-layers-pilot-diagnostic-20260721",
+  "created_at": "2026-07-21T09:28:48.728481+08:00",
+  "event_count": 12040,
+  "layer_count": 40,
+  "request_indices": [
+    0
+  ]
+}
