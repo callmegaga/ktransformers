@@ -242,6 +242,24 @@ struct GeneralMOEConfig {
   uint8_t* gpu_experts_mask = nullptr;  // Bool mask: true = expert on GPU
   void* physical_to_logical_map = nullptr;
 
+  // CPU/iGPU GPTQ INT4 scheduling. Ratios are used by fixed policies; negative
+  // phase ratios inherit cpu_igpu_igpu_ratio. The dynamic policy selects 0
+  // (CPU) or 1 (iGPU) independently for Prefill and Decode.
+  float cpu_igpu_igpu_ratio = 0.0f;
+  float cpu_igpu_prefill_ratio = -1.0f;
+  float cpu_igpu_decode_ratio = -1.0f;
+  bool cpu_igpu_dynamic = false;
+  float cpu_igpu_decode_load_low = 0.45f;
+  float cpu_igpu_decode_load_high = 0.55f;
+  float cpu_igpu_prefill_load_low = 0.65f;
+  float cpu_igpu_prefill_load_high = 0.75f;
+  float cpu_igpu_load_ewma_alpha = 0.25f;
+  int cpu_igpu_load_sample_ms = 50;
+  int cpu_igpu_decode_min_dwell = 4;
+  int cpu_igpu_prefill_min_dwell = 2;
+  // Internal: construct CPU BufferB objects as non-owning views of shared USM.
+  bool external_moe_weights = false;
+
   // Compute num_gpu_experts from gpu_experts_mask
   void compute_num_gpu_experts() {
     num_gpu_experts = 0;

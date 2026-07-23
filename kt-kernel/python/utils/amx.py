@@ -39,6 +39,7 @@ AVX2MXFP8_MOE = getattr(_moe_mod, "AVX2MXFP8_MOE", None)
 AVXVNNI256GPTQInt4_MOE = getattr(_moe_mod, "AVXVNNI256GPTQInt4_MOE", None)
 AVXVNNI256RawInt4_MOE = getattr(_moe_mod, "AVXVNNI256RawInt4_MOE", None)
 SYCLGPTQInt4_MOE = getattr(_moe_mod, "SYCLGPTQInt4_MOE", None)
+CPUiGPUGPTQInt4_MOE = getattr(_moe_mod, "CPUiGPUGPTQInt4_MOE", None)
 
 _HAS_AMXINT4_SUPPORT = AMXInt4_MOE is not None
 _HAS_AMXINT8_SUPPORT = AMXInt8_MOE is not None
@@ -57,6 +58,7 @@ _HAS_AVX2_MXFP8_SUPPORT = AVX2MXFP8_MOE is not None
 _HAS_AVXVNNI256_GPTQ_INT4_SUPPORT = AVXVNNI256GPTQInt4_MOE is not None
 _HAS_AVXVNNI256_RAW_INT4_SUPPORT = AVXVNNI256RawInt4_MOE is not None
 _HAS_SYCL_GPTQ_INT4_SUPPORT = SYCLGPTQInt4_MOE is not None
+_HAS_CPU_IGPU_GPTQ_INT4_SUPPORT = CPUiGPUGPTQInt4_MOE is not None
 _AVXVNNI256_GPTQ_INT4_MAX_GROUP_SIZE = 256
 _AVXVNNI256_RAW_INT4_MAX_GROUP_SIZE = 256
 
@@ -88,6 +90,53 @@ def _preflight_sycl_device() -> None:
             "/dev/dri/renderD*. Add the user to the render group and re-login, or set "
             "ONEAPI_DEVICE_SELECTOR to an accessible SYCL GPU."
         )
+
+
+def _configure_cpu_igpu_scheduler(config) -> None:
+    policy = os.getenv("KT_CPU_IGPU_POLICY", "dynamic").strip().lower()
+    if policy not in {"dynamic", "fixed", "phase-fixed"}:
+        raise ValueError("KT_CPU_IGPU_POLICY must be one of: dynamic, fixed, phase-fixed")
+
+    float_options = {
+        "cpu_igpu_decode_load_low": ("KT_CPU_IGPU_DECODE_LOAD_LOW", 0.45),
+        "cpu_igpu_decode_load_high": ("KT_CPU_IGPU_DECODE_LOAD_HIGH", 0.55),
+        "cpu_igpu_prefill_load_low": ("KT_CPU_IGPU_PREFILL_LOAD_LOW", 0.65),
+        "cpu_igpu_prefill_load_high": ("KT_CPU_IGPU_PREFILL_LOAD_HIGH", 0.75),
+        "cpu_igpu_load_ewma_alpha": ("KT_CPU_IGPU_LOAD_EWMA_ALPHA", 0.25),
+    }
+    int_options = {
+        "cpu_igpu_load_sample_ms": ("KT_CPU_IGPU_LOAD_SAMPLE_MS", 50),
+        "cpu_igpu_decode_min_dwell": ("KT_CPU_IGPU_DECODE_MIN_DWELL", 4),
+        "cpu_igpu_prefill_min_dwell": ("KT_CPU_IGPU_PREFILL_MIN_DWELL", 2),
+    }
+    try:
+        configured_ratio = float(os.getenv("KT_CPU_IGPU_RATIO", "0.0"))
+        config.cpu_igpu_igpu_ratio = configured_ratio
+        config.cpu_igpu_prefill_ratio = float(os.getenv("KT_CPU_IGPU_PREFILL_RATIO", str(configured_ratio)))
+        config.cpu_igpu_decode_ratio = float(os.getenv("KT_CPU_IGPU_DECODE_RATIO", str(configured_ratio)))
+        for attribute, (environment_name, default) in float_options.items():
+            setattr(config, attribute, float(os.getenv(environment_name, str(default))))
+        for attribute, (environment_name, default) in int_options.items():
+            setattr(config, attribute, int(os.getenv(environment_name, str(default))))
+    except ValueError as error:
+        raise ValueError(f"invalid CPU/iGPU scheduler environment value: {error}") from error
+    config.cpu_igpu_dynamic = policy == "dynamic"
+
+    ratios = (config.cpu_igpu_igpu_ratio, config.cpu_igpu_prefill_ratio, config.cpu_igpu_decode_ratio)
+    if any(ratio < 0.0 or ratio > 1.0 for ratio in ratios):
+        raise ValueError("CPU/iGPU fixed ratios must be between 0 and 1")
+    thresholds = (
+        (config.cpu_igpu_decode_load_low, config.cpu_igpu_decode_load_high),
+        (config.cpu_igpu_prefill_load_low, config.cpu_igpu_prefill_load_high),
+    )
+    if any(low < 0.0 or low >= high or high > 1.0 for low, high in thresholds):
+        raise ValueError("CPU/iGPU load thresholds must satisfy 0 <= low < high <= 1")
+    if not 0.0 < config.cpu_igpu_load_ewma_alpha <= 1.0:
+        raise ValueError("KT_CPU_IGPU_LOAD_EWMA_ALPHA must be in (0, 1]")
+    if config.cpu_igpu_load_sample_ms < 10:
+        raise ValueError("KT_CPU_IGPU_LOAD_SAMPLE_MS must be at least 10")
+    if config.cpu_igpu_decode_min_dwell <= 0 or config.cpu_igpu_prefill_min_dwell <= 0:
+        raise ValueError("CPU/iGPU minimum dwell values must be positive")
 
 
 def _supports_avxvnni256_gptq_int4_group_size(group_size: Optional[int]) -> bool:
@@ -612,6 +661,13 @@ class NativeMoEWrapper(BaseMoEWrapper):
                 "SYCL_GPTQ_INT4 backend not available. Rebuild kt_kernel_ext with "
                 "CPUINFER_USE_SYCL=1 using a SYCL compiler such as icpx."
             )
+        if method == "CPU_IGPU_GPTQ_INT4" and not _HAS_CPU_IGPU_GPTQ_INT4_SUPPORT:
+            raise RuntimeError(
+                "CPU_IGPU_GPTQ_INT4 backend not available. Rebuild kt_kernel_ext with "
+                "CPUINFER_USE_SYCL=1 on an AVX-VNNI-256 host."
+            )
+        if method == "CPU_IGPU_GPTQ_INT4" and not _HOST_HAS_AVX_VNNI:
+            raise RuntimeError("CPU_IGPU_GPTQ_INT4 requires AVX-VNNI-256 support on the host CPU.")
         if method == "MXFP4" and not (_HAS_MXFP4_SUPPORT or _HAS_AVX2_MXFP4_SUPPORT):
             raise RuntimeError(
                 "MXFP4 backend not available. Required ISA (any one of):\n"
@@ -666,7 +722,7 @@ class NativeMoEWrapper(BaseMoEWrapper):
             return FP8SafeTensorLoader(weight_path, scale_suffix="weight_scale")
         elif method == "BF16":
             return BF16SafeTensorLoader(weight_path)
-        elif method in ("GPTQ_INT4", "SYCL_GPTQ_INT4"):
+        elif method in ("GPTQ_INT4", "SYCL_GPTQ_INT4", "CPU_IGPU_GPTQ_INT4"):
             return GPTQSafeTensorLoader(weight_path)
         elif method == "MXFP4":
             return MXFP4SafeTensorLoader(weight_path)
@@ -904,6 +960,11 @@ class NativeMoEWrapper(BaseMoEWrapper):
                     f"{_AVXVNNI256_GPTQ_INT4_MAX_GROUP_SIZE}; AVX2 is used as the fallback when available."
                 )
             self.moe = backend_cls(moe_config)
+            if self.layer_idx == 0:
+                logger.info(
+                    "KT_SELECTED_MOE_BACKEND=GPTQ_INT4:%s",
+                    backend_cls.__name__,
+                )
         elif self.method == "SYCL_GPTQ_INT4":
             # Same symmetric GPTQ tensor layout as GPTQ_INT4; execution is on
             # the selected SYCL device.
@@ -914,6 +975,24 @@ class NativeMoEWrapper(BaseMoEWrapper):
             moe_config.quant_config.zero_point = False
             _preflight_sycl_device()
             self.moe = SYCLGPTQInt4_MOE(moe_config)
+            if self.layer_idx == 0:
+                logger.info("KT_SELECTED_MOE_BACKEND=SYCL_GPTQ_INT4")
+        elif self.method == "CPU_IGPU_GPTQ_INT4":
+            num_groups = self.gate_scales[0].shape[0]
+            actual_gs = self.hidden_size // num_groups
+            if not _supports_avxvnni256_gptq_int4_group_size(actual_gs):
+                raise RuntimeError(
+                    f"CPU_IGPU_GPTQ_INT4 does not support group_size={actual_gs}; expected a positive "
+                    f"multiple of 32 up to {_AVXVNNI256_GPTQ_INT4_MAX_GROUP_SIZE}."
+                )
+            moe_config.quant_config.bits = 4
+            moe_config.quant_config.group_size = actual_gs
+            moe_config.quant_config.zero_point = False
+            _preflight_sycl_device()
+            _configure_cpu_igpu_scheduler(moe_config)
+            self.moe = CPUiGPUGPTQInt4_MOE(moe_config)
+            if self.layer_idx == 0:
+                logger.info("KT_SELECTED_MOE_BACKEND=CPU_IGPU_GPTQ_INT4")
         elif self.method == "BF16":
             # BF16 has no quantization config needed
             # Prefer AMX backend, fall back to AVX2

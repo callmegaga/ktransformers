@@ -119,22 +119,31 @@ class AVX2_MOE_BASE {
       down_ba_.push_back(make_buffer_a(config_.max_len, config_.intermediate_size, nullptr));
       down_bc_.push_back(make_buffer_c(config_.max_len, config_.hidden_size, nullptr));
 
-      void* gate_bb_ptr = std::aligned_alloc(
-          64, (buffer_b_required_size(config_.intermediate_size, config_.hidden_size) + 63) & ~63ULL);
-      if (!gate_bb_ptr) throw std::runtime_error("aligned_alloc failed for gate BufferB");
-      owned_aligned_allocs_.push_back(gate_bb_ptr);
+      void* gate_bb_ptr = nullptr;
+      if (!config_.external_moe_weights) {
+        gate_bb_ptr = std::aligned_alloc(
+            64, (buffer_b_required_size(config_.intermediate_size, config_.hidden_size) + 63) & ~63ULL);
+        if (!gate_bb_ptr) throw std::runtime_error("aligned_alloc failed for gate BufferB");
+        owned_aligned_allocs_.push_back(gate_bb_ptr);
+      }
       gate_bb_.push_back(make_buffer_b(config_.intermediate_size, config_.hidden_size, gate_bb_ptr));
 
-      void* up_bb_ptr = std::aligned_alloc(
-          64, (buffer_b_required_size(config_.intermediate_size, config_.hidden_size) + 63) & ~63ULL);
-      if (!up_bb_ptr) throw std::runtime_error("aligned_alloc failed for up BufferB");
-      owned_aligned_allocs_.push_back(up_bb_ptr);
+      void* up_bb_ptr = nullptr;
+      if (!config_.external_moe_weights) {
+        up_bb_ptr = std::aligned_alloc(
+            64, (buffer_b_required_size(config_.intermediate_size, config_.hidden_size) + 63) & ~63ULL);
+        if (!up_bb_ptr) throw std::runtime_error("aligned_alloc failed for up BufferB");
+        owned_aligned_allocs_.push_back(up_bb_ptr);
+      }
       up_bb_.push_back(make_buffer_b(config_.intermediate_size, config_.hidden_size, up_bb_ptr));
 
-      void* down_bb_ptr = std::aligned_alloc(
-          64, (buffer_b_required_size(config_.hidden_size, config_.intermediate_size) + 63) & ~63ULL);
-      if (!down_bb_ptr) throw std::runtime_error("aligned_alloc failed for down BufferB");
-      owned_aligned_allocs_.push_back(down_bb_ptr);
+      void* down_bb_ptr = nullptr;
+      if (!config_.external_moe_weights) {
+        down_bb_ptr = std::aligned_alloc(
+            64, (buffer_b_required_size(config_.hidden_size, config_.intermediate_size) + 63) & ~63ULL);
+        if (!down_bb_ptr) throw std::runtime_error("aligned_alloc failed for down BufferB");
+        owned_aligned_allocs_.push_back(down_bb_ptr);
+      }
       down_bb_.push_back(make_buffer_b(config_.hidden_size, config_.intermediate_size, down_bb_ptr));
     }
 

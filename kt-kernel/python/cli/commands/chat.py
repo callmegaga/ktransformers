@@ -14,6 +14,7 @@ from typing import Optional
 import typer
 from rich.console import Console
 from rich.markdown import Markdown
+from rich.markup import escape
 from rich.panel import Panel
 from rich.prompt import Prompt, Confirm
 
@@ -182,12 +183,15 @@ def chat(
             tokenizer = AutoTokenizer.from_pretrained(selected_model, trust_remote_code=True)
             console.print(f"[dim]Loaded tokenizer from {selected_model}[/dim]")
             console.print()
-        except Exception as e:
-            console.print(f"[dim yellow]Warning: Could not load tokenizer, token counts will be estimated[/dim]")
+        except Exception:
+            console.print(
+                "Warning: Could not load tokenizer, token counts will be estimated",
+                style="dim yellow",
+            )
             console.print()
 
     except Exception as e:
-        print_error(t("chat_connect_failed", error=str(e)))
+        print_error(t("chat_connect_failed", error=escape(str(e))))
         console.print()
         console.print(t("chat_server_not_running"))
         console.print("  kt run <model>")
@@ -257,7 +261,7 @@ def chat(
                 console.print()
 
             except Exception as e:
-                print_error(t("chat_generation_error", error=str(e)))
+                print_error(t("chat_generation_error", error=escape(str(e))))
                 # Remove the user message that caused the error
                 messages.pop()
                 continue

@@ -60,10 +60,14 @@ static const bool _is_plain_ = false;
 #include "operators/avx2/fp8-moe.hpp"
 #include "operators/avx2/gptq_int4-moe.hpp"
 #include "operators/avx2/gptq_int4_avxvnni-moe.hpp"
+#include "operators/avx2/gptq_int4_packed_avxvnni-moe.hpp"
 #include "operators/avx2/mxfp4-moe.hpp"
 #include "operators/avx2/mxfp8-moe.hpp"
 #include "operators/avx2/rawint4-moe.hpp"
 #include "operators/avx2/rawint4_avxvnni-moe.hpp"
+#endif
+#if defined(USE_SYCL) && defined(__x86_64__)
+#include "operators/sycl/gptq_int4_cpu_igpu-moe.hpp"
 #endif
 #if defined(USE_SYCL)
 #include "operators/sycl/gptq_int4_sycl-moe.hpp"
@@ -766,6 +770,18 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
       // V4-Flash 2604B SwiGLU clamp limit (0.0 = disabled). See common.hpp.
       .def_readwrite("swiglu_limit", &GeneralMOEConfig::swiglu_limit)
       .def_readwrite("swiglu_alpha", &GeneralMOEConfig::swiglu_alpha)
+      .def_readwrite("cpu_igpu_igpu_ratio", &GeneralMOEConfig::cpu_igpu_igpu_ratio)
+      .def_readwrite("cpu_igpu_prefill_ratio", &GeneralMOEConfig::cpu_igpu_prefill_ratio)
+      .def_readwrite("cpu_igpu_decode_ratio", &GeneralMOEConfig::cpu_igpu_decode_ratio)
+      .def_readwrite("cpu_igpu_dynamic", &GeneralMOEConfig::cpu_igpu_dynamic)
+      .def_readwrite("cpu_igpu_decode_load_low", &GeneralMOEConfig::cpu_igpu_decode_load_low)
+      .def_readwrite("cpu_igpu_decode_load_high", &GeneralMOEConfig::cpu_igpu_decode_load_high)
+      .def_readwrite("cpu_igpu_prefill_load_low", &GeneralMOEConfig::cpu_igpu_prefill_load_low)
+      .def_readwrite("cpu_igpu_prefill_load_high", &GeneralMOEConfig::cpu_igpu_prefill_load_high)
+      .def_readwrite("cpu_igpu_load_ewma_alpha", &GeneralMOEConfig::cpu_igpu_load_ewma_alpha)
+      .def_readwrite("cpu_igpu_load_sample_ms", &GeneralMOEConfig::cpu_igpu_load_sample_ms)
+      .def_readwrite("cpu_igpu_decode_min_dwell", &GeneralMOEConfig::cpu_igpu_decode_min_dwell)
+      .def_readwrite("cpu_igpu_prefill_min_dwell", &GeneralMOEConfig::cpu_igpu_prefill_min_dwell)
 
       ;
 
@@ -833,11 +849,16 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
   bind_moe_module<AVX2_MXFP8_MOE_TP<avx2::GemmKernelAVX2MXFP8>>(moe_module, "AVX2MXFP8_MOE");
   bind_moe_module<AVXVNNI256_GPTQ_INT4_MOE_TP<avxvnni::GemmKernelAVXVNNI256GPTQInt4>>(moe_module,
                                                                                       "AVXVNNI256GPTQInt4_MOE");
+  bind_moe_module<AVXVNNI256_PACKED_GPTQ_INT4_MOE_TP<avxvnni_packed::GemmKernelAVXVNNI256PackedGPTQInt4>>(
+      moe_module, "AVXVNNI256PackedGPTQInt4_MOE");
   bind_moe_module<AVXVNNI256_RAW_INT4_MOE_TP<avxvnni_rawint4::GemmKernelAVXVNNI256RawInt4>>(moe_module,
                                                                                             "AVXVNNI256RawInt4_MOE");
 #endif
 #if defined(USE_SYCL)
   bind_moe_module<SYCL_GPTQ_INT4_MOE_TP<sycl_int4::GemmKernelSYCLGPTQInt4>>(moe_module, "SYCLGPTQInt4_MOE");
+#endif
+#if defined(USE_SYCL) && defined(__x86_64__)
+  bind_moe_module<CPU_IGPU_GPTQ_INT4_MOE_PART>(moe_module, "CPUiGPUGPTQInt4_MOE");
 #endif
 
 #if defined(USE_MOE_KERNEL)

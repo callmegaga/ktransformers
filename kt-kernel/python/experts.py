@@ -40,6 +40,7 @@ INFERENCE_METHODS = frozenset(
         "FP8_PERCHANNEL",  # Per-channel FP8
         "GPTQ_INT4",  # GPTQ INT4
         "SYCL_GPTQ_INT4",  # GPTQ INT4 experts on a SYCL device
+        "CPU_IGPU_GPTQ_INT4",  # Dynamically schedule shared GPTQ INT4 experts across CPU and Intel iGPU
         "MXFP4",  # MXFP4 (E2M1 nibble + ue8m0 group scale, e.g. DeepSeek-V4-Flash routed experts)
         "MXFP8",  # MXFP8 (E4M3fn byte + ue8m0 group scale, e.g. MiniMax-M3-Preview)
         "LLAMAFILE",  # GGUF format
@@ -343,6 +344,7 @@ def _create_inference_wrapper(
         "FP8_PERCHANNEL",
         "GPTQ_INT4",
         "SYCL_GPTQ_INT4",
+        "CPU_IGPU_GPTQ_INT4",
         "MXFP4",
         "MXFP8",
     ]:
