@@ -15,8 +15,8 @@
         <link rel="icon" href="../../favicon-de23e50b.svg">
         <link rel="shortcut icon" href="../../favicon-8114d1fc.png">
         <link rel="stylesheet" href="../../css/variables-8adf115d.css">
-        <link rel="stylesheet" href="../../css/general-2459343d.css">
-        <link rel="stylesheet" href="../../css/chrome-ae938929.css">
+        <link rel="stylesheet" href="../../css/general-e96d0476.css">
+        <link rel="stylesheet" href="../../css/chrome-d279d366.css">
         <link rel="stylesheet" href="../../css/print-9e4910d8.css" media="print">
 
         <!-- Fonts -->
@@ -35,10 +35,10 @@
             const path_to_root = "../../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../../searchindex-b4d4a2ba.js";
+            window.path_to_searchindex_js = "../../searchindex-a6b97773.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../../toc-1efa58c4.js"></script>
+        <script src="../../toc-78d73750.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -193,6 +193,7 @@
 <li><a href="#example-qwen3-30b-a3b-bf16">Example: Qwen3-30B-A3B (BF16)</a></li>
 <li><a href="#example-qwen35-35b-a3b-fp8-fp8">Example: Qwen3.5-35B-A3B-FP8 (FP8)</a></li>
 <li><a href="#example-qwen3-30b-a3b-gptq-int4-gptq_int4">Example: Qwen3-30B-A3B-GPTQ-Int4 (GPTQ_INT4)</a></li>
+<li><a href="#example-kimi-k25-rawint4">Example: Kimi-K2.5 (RAWINT4)</a></li>
 <li><a href="#sending-requests">Sending Requests</a></li>
 </ul>
 </li>
@@ -209,6 +210,7 @@
 <tr><td><code>BF16</code></td><td>BF16 native precision</td><td>Zero precision loss, uses BF16 weights directly</td></tr>
 <tr><td><code>FP8</code></td><td>FP8 block quantization</td><td></td></tr>
 <tr><td><code>GPTQ_INT4</code></td><td>INT4 GPTQ</td><td></td></tr>
+<tr><td><code>RAWINT4</code></td><td>Raw INT4 with BF16 scales</td><td>Used by Kimi-K2.5; weights stored in compressed SafeTensor format</td></tr>
 </tbody>
 </table>
 </div>
@@ -229,7 +231,8 @@ git submodule update --init --recursive
 ./install.sh
 </code></pre>
 <p>On AVX512 or AMX machines, you can also manually force AVX2 compilation:</p>
-<pre><code class="language-bash">export CPUINFER_CPU_INSTRUCT=AVX2
+<pre><code class="language-bash">export KT_RAWINT4_BACKEND=avx2
+export CPUINFER_CPU_INSTRUCT=AVX2
 export CPUINFER_ENABLE_AMX=OFF
 ./install.sh kt-kernel --manual
 </code></pre>
@@ -245,7 +248,7 @@ python -c "import kt_kernel; print(kt_kernel.__cpu_variant__)"
 kt doctor
 </code></pre>
 <h2 id="starting-the-inference-server"><a class="header" href="#starting-the-inference-server">Starting the Inference Server</a></h2>
-<p>Use <code>--kt-method BF16</code>, <code>FP8</code>, or <code>GPTQ_INT4</code>. KT-Kernel will <strong>automatically detect</strong> the CPU and fall back to the AVX2 backend when AVX512/AMX is unavailable.</p>
+<p>Use <code>--kt-method BF16</code>, <code>FP8</code>, <code>GPTQ_INT4</code>, or <code>RAWINT4</code>. KT-Kernel will <strong>automatically detect</strong> the CPU and fall back to the AVX2 backend when AVX512/AMX is unavailable.</p>
 <h3 id="example-qwen3-30b-a3b-bf16"><a class="header" href="#example-qwen3-30b-a3b-bf16">Example: Qwen3-30B-A3B (BF16)</a></h3>
 <pre><code class="language-bash"># Download the model
 huggingface-cli download Qwen/Qwen3-30B-A3B --local-dir /path/to/Qwen3-30B-A3B
@@ -320,6 +323,34 @@ python -m sglang.launch_server \
   --tensor-parallel-size 1 \
   --disable-shared-experts-fusion
 </code></pre>
+<h3 id="example-kimi-k25-rawint4"><a class="header" href="#example-kimi-k25-rawint4">Example: Kimi-K2.5 (RAWINT4)</a></h3>
+<blockquote>
+<p><strong>Note</strong>: The following command is optimized for 4x RTX PRO 6000 Blackwell (96GB each) + AMD Threadripper PRO 5995WX (64 cores, 1 NUMA node) + 256GB RAM.</p>
+</blockquote>
+<pre><code class="language-bash"># Download the model
+huggingface-cli download moonshotai/Kimi-K2.5 --local-dir /path/to/Kimi-K2.5
+
+# Start the server
+python -m sglang.launch_server \
+  --host 0.0.0.0 --port 30000 \
+  --model /path/to/Kimi-K2.5 \
+  --kt-weight-path /path/to/Kimi-K2.5 \
+  --kt-cpuinfer 64 \
+  --kt-threadpool-count 1 \
+  --kt-num-gpu-experts 228 \
+  --kt-enable-dynamic-expert-update \
+  --kt-method RAWINT4 \
+  --attention-backend flashinfer \
+  --trust-remote-code \
+  --mem-fraction-static 0.95 \
+  --chunked-prefill-size 8192 \
+  --max-running-requests 4 \
+  --context-length 262144 \
+  --enable-mixed-chunk \
+  --tensor-parallel-size 4 \
+  --enable-p2p-check \
+  --disable-shared-experts-fusion
+</code></pre>
 <h3 id="sending-requests"><a class="header" href="#sending-requests">Sending Requests</a></h3>
 <pre><code class="language-bash"># Interactive chat
 kt chat
@@ -348,7 +379,7 @@ curl http://localhost:30000/v1/chat/completions \
 
                     <nav class="nav-wrapper" aria-label="Page navigation">
                         <!-- Mobile navigation buttons -->
-                            <a rel="prev" href="../../en/kt-kernel/kt-cli.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                            <a rel="prev" href="../../zh/GLM-5.3-Flash-Tutorial_zh.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                             </a>
 
@@ -362,7 +393,7 @@ curl http://localhost:30000/v1/chat/completions \
             </div>
 
             <nav class="nav-wide-wrapper" aria-label="Page navigation">
-                    <a rel="prev" href="../../en/kt-kernel/kt-cli.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                    <a rel="prev" href="../../zh/GLM-5.3-Flash-Tutorial_zh.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                     </a>
 
@@ -393,11 +424,11 @@ curl http://localhost:30000/v1/chat/completions \
 
         <script src="../../elasticlunr-ef4e11c1.min.js"></script>
         <script src="../../mark-09e88c2c.min.js"></script>
-        <script src="../../searcher-c2a407aa.js"></script>
+        <script src="../../searcher-09f2665d.js"></script>
 
         <script src="../../clipboard-1626706a.min.js"></script>
         <script src="../../highlight-abc7f01d.js"></script>
-        <script src="../../book-a0b12cfe.js"></script>
+        <script src="../../book-609e4cb8.js"></script>
 
         <!-- Custom JS scripts -->
 
