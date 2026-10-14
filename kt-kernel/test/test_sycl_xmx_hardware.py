@@ -441,3 +441,31 @@ def test_fused_expert_rejects_unsupported_dimensions(setup, monkeypatch):
     monkeypatch.setenv('KT_SYCL_XMX_FUSED_EXPERT', '1')
     with pytest.raises(RuntimeError, match='FUSED_EXPERT'):
         ext.moe.SYCLXMXGPTQInt4_MOE(config)
+
+
+
+@pytest.mark.parametrize('setting,value', [('KT_SYCL_XMX_MODE', 'fp16'), ('KT_SYCL_XMX_GATE_SPLITS', '4'),
+                                          ('KT_SYCL_XMX_DECODE_MERGE', 'fused')])
+def test_fused_expert_rejects_incompatible_options(setup, monkeypatch, setting, value):
+    ext, torch, cpu, _, *_ = setup
+    mask = torch.zeros(4, dtype=torch.bool)
+    config = ext.moe.MOEConfig(4, 2, 2048, 512, mask.data_ptr())
+    config.pool = cpu.backend_
+    config.max_len = 1
+    config.quant_config.bits = 4
+    config.quant_config.group_size = 128
+    config.quant_config.zero_point = False
+    monkeypatch.setenv('KT_SYCL_XMX_FUSED_EXPERT', '1')
+    monkeypatch.setenv('KT_SYCL_XMX_GATE_SPLITS', '2')
+    monkeypatch.setenv('KT_SYCL_XMX_DECODE_GATE_KERNEL', 'xmx-split')
+    monkeypatch.setenv('KT_SYCL_XMX_DECODE_DOWN_KERNEL', 'xmx')
+    monkeypatch.setenv('KT_SYCL_XMX_DECODE_MERGE', 'separate')
+    monkeypatch.setenv(setting, value)
+    with pytest.raises(RuntimeError, match='FUSED_EXPERT'):
+        ext.moe.SYCLXMXGPTQInt4_MOE(config)
+
+
+
+def test_xmx_implementation_revision_is_reported(setup):
+    ext, _, _, _, *_ = setup
+    assert ext.moe.SYCLXMXGPTQInt4_MOE.implementation_revision() >= 4

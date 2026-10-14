@@ -488,6 +488,10 @@ void bind_moe_module(py::module_& moe_module, const char* name) {
         .def("reset_profile", &MoeClass::reset_profile);
   }
 
+  if constexpr (requires { MoeClass::implementation_revision(); }) {
+    moe_cls.def_static("implementation_revision", &MoeClass::implementation_revision);
+  }
+
   // Bind write_weight_scale_to_buffer_task for MoE types that support it
   // Uses SFINAE to detect if MoeClass has write_weight_scale_to_buffer method
   if constexpr (requires { &MoeClass::write_weight_scale_to_buffer; }) {

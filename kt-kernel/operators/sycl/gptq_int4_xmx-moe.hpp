@@ -50,7 +50,7 @@ class SYCL_XMX_GPTQ_INT4_MOE_TP {
     fused_expert_ = expert_mode == "1";
     if (fused_expert_ && (!q8_ || c.hidden_size != 2048 || c.intermediate_size != 512 || gs != 128 ||
                           (decode_gate_ != Kernel::XMX && decode_gate_ != Kernel::XMXSplit) ||
-                          decode_down_ != Kernel::XMX || gate_splits_ > 2))
+                          decode_down_ != Kernel::XMX || (decode_gate_ == Kernel::XMXSplit && gate_splits_ > 2)))
       throw std::runtime_error("KT_SYCL_XMX_FUSED_EXPERT requires INT8 XMX H=2048 I=512 group=128, unsplit down and gate splits<=2");
     const char* merge = std::getenv("KT_SYCL_XMX_DECODE_MERGE");
     const std::string merge_mode = merge ? merge : "separate";
@@ -478,6 +478,7 @@ class TP_MOE<SYCL_XMX_GPTQ_INT4_MOE_TP> : public TP_MOE_Common<SYCL_XMX_GPTQ_INT
       throw std::runtime_error("KT_SYCL_XMX_NUMA_DISPATCH must be 0 or 1");
     use_numa_dispatch_ = numa && std::string(numa) == "1";
   }
+  static int implementation_revision() { return 4; }
   void load_weights() override {
     this->weights_loaded = false;
     this->tps[0]->load_weights(this->config);
