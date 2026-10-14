@@ -24,6 +24,11 @@ VARIANTS = {
     'split': {'KT_SYCL_XMX_DECODE_GATE_KERNEL': 'xmx-split', 'KT_SYCL_XMX_GATE_SPLITS': '2'},
     'fused-merge': {'KT_SYCL_XMX_DECODE_MERGE': 'fused'},
     'split-fused-merge': {'KT_SYCL_XMX_DECODE_MERGE': 'fused', 'KT_SYCL_XMX_DECODE_GATE_KERNEL': 'xmx-split'},
+    'fused-expert': {'KT_SYCL_XMX_FUSED_EXPERT': '1'},
+    'split-fused-expert': {'KT_SYCL_XMX_FUSED_EXPERT': '1', 'KT_SYCL_XMX_DECODE_GATE_KERNEL': 'xmx-split'},
+    'split-fused-expert-host': {'KT_SYCL_XMX_FUSED_EXPERT': '1', 'KT_SYCL_XMX_DECODE_GATE_KERNEL': 'xmx-split', 'KT_SYCL_XMX_HOST_QUANT': '1'},
+    'split-fused-expert-graph': {'KT_SYCL_XMX_FUSED_EXPERT': '1', 'KT_SYCL_XMX_DECODE_GATE_KERNEL': 'xmx-split', 'KT_SYCL_XMX_GRAPH': '1'},
+    'split-fused-expert-host-graph': {'KT_SYCL_XMX_FUSED_EXPERT': '1', 'KT_SYCL_XMX_DECODE_GATE_KERNEL': 'xmx-split', 'KT_SYCL_XMX_HOST_QUANT': '1', 'KT_SYCL_XMX_GRAPH': '1'},
     'direct': {'KT_SYCL_XMX_NUMA_DISPATCH': '0'},
     'host-quant': {'KT_SYCL_XMX_HOST_QUANT': '1'},
     'graph': {'KT_SYCL_XMX_GRAPH': '1'},
@@ -55,7 +60,7 @@ def main():
         p.error('Invalid or duplicate variants')
     if args.samples <= 0 or args.warmup < 0 or min(rows_list) <= 0 or not 0 < args.active <= args.experts:
         p.error('Invalid dimensions or repetitions')
-    if args.trace == 'device' and 'graph' in names:
+    if args.trace == 'device' and any(VARIANTS[name].get('KT_SYCL_XMX_GRAPH') == '1' for name in names):
         p.error('Recorded graph nodes have no individual event profiling; use --trace host')
     if args.transport == 'cuda' and not torch.cuda.is_available():
         p.error('CUDA transport requires a NVIDIA GPU and CUDA-enabled torch')
@@ -76,7 +81,7 @@ def main():
                 'KT_SYCL_XMX_DECODE_DOWN_KERNEL': 'inherit', 'KT_SYCL_XMX_GATE_SPLITS': '2',
                 'KT_SYCL_XMX_DOWN_SPLITS': '1', 'KT_SYCL_XMX_FUSED_QUANT': 'prefill',
                 'KT_SYCL_XMX_GRAPH': '0', 'KT_SYCL_XMX_HOST_QUANT': '0',
-                'KT_SYCL_XMX_NUMA_DISPATCH': '1', 'KT_SYCL_XMX_DECODE_MERGE': 'separate'}
+                'KT_SYCL_XMX_NUMA_DISPATCH': '1', 'KT_SYCL_XMX_DECODE_MERGE': 'separate', 'KT_SYCL_XMX_FUSED_EXPERT': '0'}
     for name in names:
         settings[name] = defaults | VARIANTS[name]
         os.environ.update(settings[name])

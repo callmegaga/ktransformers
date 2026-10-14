@@ -11,6 +11,7 @@
 #include "../moe-tp.hpp"
 #include "gptq_int4_vector-kernels.hpp"
 #include "gptq_int4_xmx-profile.hpp"
+#include "gptq_int4_xmx-fused-expert.hpp"
 
 // Dedicated single-NUMA executor. No CPU expert-input pools or FP16 weight copy.
 class SYCL_XMX_GPTQ_INT4_MOE_TP {
@@ -42,11 +43,21 @@ class SYCL_XMX_GPTQ_INT4_MOE_TP {
     vector_splits_ = parse_splits("KT_SYCL_XMX_VECTOR_SPLITS", 4);
     gate_splits_ = parse_splits("KT_SYCL_XMX_GATE_SPLITS", vector_splits_);
     down_splits_ = parse_splits("KT_SYCL_XMX_DOWN_SPLITS", vector_splits_);
+    const char* expert = std::getenv("KT_SYCL_XMX_FUSED_EXPERT");
+    const std::string expert_mode = expert ? expert : "0";
+    if (expert_mode != "0" && expert_mode != "1")
+      throw std::runtime_error("KT_SYCL_XMX_FUSED_EXPERT must be 0 or 1");
+    fused_expert_ = expert_mode == "1";
+    if (fused_expert_ && (!q8_ || c.hidden_size != 2048 || c.intermediate_size != 512 || gs != 128 ||
+                          (decode_gate_ != Kernel::XMX && decode_gate_ != Kernel::XMXSplit) ||
+                          decode_down_ != Kernel::XMX || gate_splits_ > 2))
+      throw std::runtime_error("KT_SYCL_XMX_FUSED_EXPERT requires INT8 XMX H=2048 I=512 group=128, unsplit down and gate splits<=2");
     const char* merge = std::getenv("KT_SYCL_XMX_DECODE_MERGE");
     const std::string merge_mode = merge ? merge : "separate";
     if (merge_mode != "separate" && merge_mode != "fused")
       throw std::runtime_error("KT_SYCL_XMX_DECODE_MERGE must be separate or fused");
     fused_merge_ = merge_mode == "fused";
+    if (fused_expert_ && fused_merge_) throw std::runtime_error("KT_SYCL_XMX_FUSED_EXPERT does not support fused decode merge");
     if (fused_merge_ && (c.num_experts_per_tok > 8 || decode_down_ != Kernel::XMX))
       throw std::runtime_error("KT_SYCL_XMX_DECODE_MERGE=fused requires topk<=8 and unsplit XMX decode down");
     const char* tile_rows = std::getenv("KT_SYCL_XMX_ROWS");
@@ -104,6 +115,7 @@ class SYCL_XMX_GPTQ_INT4_MOE_TP {
       sm_.reserve(static_cast<size_t>(max_routed) * c.intermediate_size / gs);
     }
     printf("Created SYCL_XMX_GPTQ_INT4_MOE mode=%s layer=%d\n", value.c_str(), c.layer_idx);
+    printf("SYCL decode fused_expert=%d merge=%s\n", fused_expert_, merge_mode.c_str());
     printf("SYCL projection kernels prefill=%s/%s decode=%s/%s splits=%d/%d\n", kernel_name(gate_kernel_),
            kernel_name(down_kernel_), kernel_name(decode_gate_), kernel_name(decode_down_), gate_splits_, down_splits_);
   }
@@ -289,6 +301,7 @@ class SYCL_XMX_GPTQ_INT4_MOE_TP {
   int tile_rows_ = 8;
   bool use_graph_ = false;
   bool fused_merge_ = false;
+  bool fused_expert_ = false;
   bool host_quant_ = false;
   bool fused_quant_ = false;
   bool fused_decode_ = false;
@@ -368,6 +381,21 @@ class SYCL_XMX_GPTQ_INT4_MOE_TP {
       qi =
           sycl_xmx::quantize(input_.data, qi_.data, si_.data, rows, config.hidden_size, config.quant_config.group_size);
     if (device_quant) remember(sycl_xmx::PipelineProfile::InputQuant, qi);
+    if constexpr (Rows == 1) {
+      if (rows == 1 && fused_expert_) {
+        sycl::event experts;
+#define KT_FUSED_EXPERT(S) sycl_xmx::fused_expert_decode<S>(tiles_.data, nt, qi_.data, si_.data, gate_, up_, \
+    down_weight_, down_.data, config.swiglu_limit, config.swiglu_alpha, device_quant ? &qi : nullptr)
+        if (gate == Kernel::XMX || gate_splits_ == 1) experts = KT_FUSED_EXPERT(1);
+        else experts = KT_FUSED_EXPERT(2);
+#undef KT_FUSED_EXPERT
+        remember(sycl_xmx::PipelineProfile::Gate, experts);  // includes quantization and down
+        auto result = sycl_xmx::merge(slot_rows_.data, routing_.data, down_.data, output_.data, rows, topk,
+                                      config.hidden_size, experts);
+        remember(sycl_xmx::PipelineProfile::Merge, result);
+        return result;
+      }
+    }
     auto gu = submit_projection<Rows, true>(gate, device_quant ? &qi : nullptr, nt, use_fused_quant);
     remember(sycl_xmx::PipelineProfile::Gate, gu);
     sycl::event middle = gu;

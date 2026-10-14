@@ -166,7 +166,7 @@ def main():
             record['kernels'] = {key: os.getenv(key) for key in ('KT_SYCL_XMX_MODE', 'KT_SYCL_XMX_GATE_KERNEL',
                 'KT_SYCL_XMX_DOWN_KERNEL', 'KT_SYCL_XMX_DECODE_GATE_KERNEL', 'KT_SYCL_XMX_DECODE_DOWN_KERNEL',
                 'KT_SYCL_XMX_GATE_SPLITS', 'KT_SYCL_XMX_DOWN_SPLITS', 'KT_SYCL_XMX_DECODE_MERGE',
-                'KT_SYCL_XMX_TRACE')}
+                'KT_SYCL_XMX_TRACE', 'KT_SYCL_XMX_FUSED_EXPERT')}
             if args.check:
                 run()  # Compare the base route, separately from timed requests.
                 ref = refs[rows]
@@ -192,7 +192,7 @@ def main():
                                                        'KT_SYCL_XMX_GATE_KERNEL', 'KT_SYCL_XMX_DOWN_KERNEL',
                                                        'KT_SYCL_XMX_DECODE_GATE_KERNEL', 'KT_SYCL_XMX_DECODE_DOWN_KERNEL',
                                                        'KT_SYCL_XMX_VECTOR_SPLITS', 'KT_SYCL_XMX_GATE_SPLITS', 'KT_SYCL_XMX_DOWN_SPLITS',
-                                                       'KT_SYCL_XMX_DECODE_MERGE', 'KT_SYCL_XMX_TRACE', 'KT_SYCL_XMX_TRACE_EVERY', 'KT_SYCL_PROFILE',
+                                                       'KT_SYCL_XMX_DECODE_MERGE', 'KT_SYCL_XMX_FUSED_EXPERT', 'KT_SYCL_XMX_TRACE', 'KT_SYCL_XMX_TRACE_EVERY', 'KT_SYCL_PROFILE',
                                                        'ONEAPI_DEVICE_SELECTOR')}
         args.output.write_text(json.dumps({'config': config, 'environment': environment, 'results': results}, indent=2))
 

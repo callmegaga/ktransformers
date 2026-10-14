@@ -372,3 +372,72 @@ def test_device_trace_requires_profiled_queue(setup, monkeypatch):
         pytest.skip('Queue profiling was explicitly enabled for this test process')
     with pytest.raises(RuntimeError, match='requires KT_SYCL_PROFILE=1'):
         ext.moe.SYCLXMXGPTQInt4_MOE(config)
+
+
+@pytest.mark.parametrize('splits', ['1', '2'])
+@pytest.mark.parametrize('graph', ['0', '1'])
+@pytest.mark.parametrize('host_quant', ['0', '1'])
+def test_fused_expert_decode_matches_staged_and_preserves_prefill(setup, monkeypatch, splits, graph, host_quant):
+    from pathlib import Path
+    import importlib.util
+    spec = importlib.util.spec_from_file_location('projection_reference', Path(__file__).parents[1] / 'bench/bench_sycl_xmx_moe.py')
+    reference_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(reference_module)
+    ext, torch, cpu, _, *_ = setup
+    monkeypatch.setenv('KT_SYCL_XMX_HOST_QUANT', host_quant)
+    generator = torch.Generator().manual_seed(47)
+    mask = torch.tensor([False, False, False, True])
+    config = ext.moe.MOEConfig(4, 4, 2048, 512, mask.data_ptr())
+    config.pool = cpu.backend_
+    config.max_len = 17
+    config.quant_config.bits = 4
+    config.quant_config.group_size = 128
+    config.quant_config.zero_point = False
+    config.swiglu_limit = 1.5
+    config.swiglu_alpha = 1.702
+    proj = [reference_module.packed_weights(4, 512, 2048, 128, generator),
+            reference_module.packed_weights(4, 512, 2048, 128, generator),
+            reference_module.packed_weights(4, 2048, 512, 128, generator)]
+    for stage, (qw, sc) in zip(('gate', 'up', 'down'), proj):
+        setattr(config, stage + '_projs', [[t.data_ptr() for t in qw]])
+        setattr(config, stage + '_scales', [[t.data_ptr() for t in sc]])
+    mapping = torch.tensor([2, 0, 3, 1], dtype=torch.int64)
+    monkeypatch.setenv('KT_SYCL_XMX_MODE', 'int8')
+    monkeypatch.setenv('KT_SYCL_XMX_DECODE_GATE_KERNEL', 'xmx-split')
+    monkeypatch.setenv('KT_SYCL_XMX_DECODE_DOWN_KERNEL', 'xmx')
+    monkeypatch.setenv('KT_SYCL_XMX_GATE_SPLITS', splits)
+    monkeypatch.setenv('KT_SYCL_XMX_FUSED_QUANT', 'prefill')
+    monkeypatch.setenv('KT_SYCL_XMX_GRAPH', graph)
+    monkeypatch.setenv('KT_SYCL_XMX_DECODE_MERGE', 'separate')
+    monkeypatch.setenv('KT_SYCL_XMX_FUSED_EXPERT', '0')
+    staged = ext.moe.SYCLXMXGPTQInt4_MOE(config)
+    monkeypatch.setenv('KT_SYCL_XMX_FUSED_EXPERT', '1')
+    fused = ext.moe.SYCLXMXGPTQInt4_MOE(config)
+    for moe in (staged, fused):
+        cpu.submit(moe.load_weights_task(mapping.data_ptr())); cpu.sync()
+    for rows in (1, 17):
+        for route in ([0, 1, 2, -1], [1, 1, 0, 3], [-1, 99, 2, -1], [-1, -1, -1, -1]):
+            x = torch.randn(rows, 2048, generator=generator).bfloat16()
+            ids = torch.tensor([route] * rows, dtype=torch.int64)
+            weights = torch.softmax(torch.randn(rows, 4, generator=generator), 1)
+            qlen = torch.tensor([rows], dtype=torch.int32)
+            outputs = []
+            for moe in (staged, fused):
+                out = torch.empty_like(x)
+                cpu.submit(moe.forward_task(qlen.data_ptr(), 4, ids.data_ptr(), weights.data_ptr(), x.data_ptr(), out.data_ptr(), False)); cpu.sync()
+                outputs.append(out.clone())
+                previous = out.clone()
+                cpu.submit(moe.forward_task(qlen.data_ptr(), 4, ids.data_ptr(), weights.data_ptr(), x.data_ptr(), out.data_ptr(), True)); cpu.sync()
+                torch.testing.assert_close(out, (previous.float() * 2).bfloat16(), rtol=0, atol=0)
+            # Same group boundaries/scales and BF16 rounding; allow rare
+            # quantization ties from ESIMD vs scalar SIMD division.
+            denominator = outputs[0].float().square().mean().sqrt().clamp_min(1e-12)
+            rmse = (outputs[0].float() - outputs[1].float()).square().mean().sqrt() / denominator
+            assert rmse < .005
+
+
+def test_fused_expert_rejects_unsupported_dimensions(setup, monkeypatch):
+    ext, _, _, config, *_ = setup
+    monkeypatch.setenv('KT_SYCL_XMX_FUSED_EXPERT', '1')
+    with pytest.raises(RuntimeError, match='FUSED_EXPERT'):
+        ext.moe.SYCLXMXGPTQInt4_MOE(config)
