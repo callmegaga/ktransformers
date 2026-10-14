@@ -108,12 +108,16 @@ def test_invalid_tuning_is_rejected(setup, monkeypatch, name, value):
 
 
 @pytest.mark.parametrize('fused', ['0', '1', 'prefill'])
-def test_graph_reads_changing_inputs_and_routes(setup, monkeypatch, fused):
+@pytest.mark.parametrize('decode_gate', ['xmx', 'vector', 'dp4a', 'xmx-split'])
+def test_graph_reads_changing_inputs_and_routes(setup, monkeypatch, fused, decode_gate):
     ext, torch, cpu, config, mask, qw, scales = setup
     generator = torch.Generator().manual_seed(20261014)
     qw.copy_(torch.randint(-(1 << 31), (1 << 31) - 1, qw.shape, dtype=torch.int32, generator=generator))
     scales.fill_(0.003)
     monkeypatch.setenv('KT_SYCL_XMX_FUSED_QUANT', fused)
+    monkeypatch.setenv('KT_SYCL_XMX_DECODE_GATE_KERNEL', decode_gate)
+    if fused == '1' and decode_gate != 'xmx':
+        pytest.skip('Full quantization fusion requires XMX gate')
     monkeypatch.setenv('KT_SYCL_XMX_GRAPH', '0')
     direct = ext.moe.SYCLXMXGPTQInt4_MOE(config)
     monkeypatch.setenv('KT_SYCL_XMX_GRAPH', '1')
@@ -164,3 +168,207 @@ def test_fused_quantization_matches_unfused(setup, monkeypatch, rows, fused_mode
         cpu.sync()
         outputs.append(out)
     torch.testing.assert_close(*outputs, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize('gate,down', [('vector', 'vector'), ('dp4a', 'dp4a'), ('xmx', 'dp4a'),
+                                      ('dp4a', 'xmx'), ('vector', 'xmx'), ('xmx', 'vector'),
+                                      ('xmx-split', 'xmx'), ('xmx', 'xmx-split')])
+@pytest.mark.parametrize('rows', [1, 7])
+def test_projection_candidates_against_reference(setup, monkeypatch, gate, down, rows):
+    ext, torch, cpu, config, mask, qw, scales = setup
+    generator = torch.Generator().manual_seed(73)
+    qw.copy_(torch.randint(-(1 << 31), (1 << 31) - 1, qw.shape, dtype=torch.int32, generator=generator))
+    scales.fill_(0.003)
+    monkeypatch.setenv('KT_SYCL_XMX_MODE', 'int8')
+    monkeypatch.setenv('KT_SYCL_XMX_FUSED_QUANT', '0')
+    monkeypatch.setenv('KT_SYCL_XMX_GATE_KERNEL', gate)
+    monkeypatch.setenv('KT_SYCL_XMX_DOWN_KERNEL', down)
+    monkeypatch.delenv('KT_SYCL_XMX_DECODE_GATE_KERNEL', raising=False)
+    monkeypatch.delenv('KT_SYCL_XMX_DECODE_DOWN_KERNEL', raising=False)
+    moe = ext.moe.SYCLXMXGPTQInt4_MOE(config)
+    cpu.submit(moe.load_weights_task()); cpu.sync()
+    x = torch.randn(rows, 128, generator=generator).bfloat16()
+    ids = torch.tensor([[0, 1]] * rows, dtype=torch.int64)
+    weights = torch.full((rows, 2), 0.5)
+    out = torch.empty_like(x)
+    qlen = torch.tensor([rows], dtype=torch.int32)
+    cpu.submit(moe.forward_task(qlen.data_ptr(), 2, ids.data_ptr(), weights.data_ptr(), x.data_ptr(), out.data_ptr(), False)); cpu.sync()
+    shift = torch.arange(8) * 4
+    deq = (((qw.long()[..., None] >> shift) & 15) - 8).permute(0, 1, 3, 2).reshape(4, 128, 128).float() * 0.003
+    expected = torch.zeros(rows, 128)
+    for e in (0, 1):
+        projection = x.float() @ deq[e]
+        middle = (torch.nn.functional.silu(projection) * projection).bfloat16().float()
+        expected += (middle @ deq[e]).bfloat16().float() * 0.5
+    expected = expected.bfloat16().float()
+    rmse = (out.float() - expected).square().mean().sqrt() / expected.square().mean().sqrt().clamp_min(1e-12)
+    assert bool(torch.isfinite(out).all())
+    assert rmse < 0.04
+
+
+@pytest.mark.parametrize('name,value', [('KT_SYCL_XMX_GATE_KERNEL', 'typo'), ('KT_SYCL_XMX_DOWN_KERNEL', 'auto'),
+                                      ('KT_SYCL_XMX_DECODE_GATE_KERNEL', 'bad'), ('KT_SYCL_XMX_VECTOR_SPLITS', '3'),
+                                      ('KT_SYCL_XMX_GATE_SPLITS', '0'), ('KT_SYCL_XMX_DOWN_SPLITS', '16')])
+def test_invalid_projection_selection_is_rejected(setup, monkeypatch, name, value):
+    ext, _, _, config, *_ = setup
+    monkeypatch.setenv(name, value)
+    with pytest.raises(RuntimeError, match=name):
+        ext.moe.SYCLXMXGPTQInt4_MOE(config)
+
+
+def test_prefill_fusion_allows_vector_decode_but_rejects_full_fusion(setup, monkeypatch):
+    ext, _, _, config, *_ = setup
+    monkeypatch.setenv('KT_SYCL_XMX_DECODE_GATE_KERNEL', 'vector')
+    monkeypatch.setenv('KT_SYCL_XMX_FUSED_QUANT', 'prefill')
+    ext.moe.SYCLXMXGPTQInt4_MOE(config)
+    monkeypatch.setenv('KT_SYCL_XMX_FUSED_QUANT', '1')
+    with pytest.raises(RuntimeError, match='fused quantization'):
+        ext.moe.SYCLXMXGPTQInt4_MOE(config)
+
+
+@pytest.mark.parametrize('decode_gate,decode_down', [
+    ('vector', 'xmx'), ('xmx', 'vector'), ('dp4a', 'xmx'), ('xmx', 'dp4a'),
+    ('xmx-split', 'xmx'), ('xmx', 'xmx-split'),
+])
+@pytest.mark.parametrize('host_quant', ['0', '1'])
+def test_decode_overrides_preserve_prefill_and_capture_settings(
+        setup, monkeypatch, decode_gate, decode_down, host_quant):
+    """Decode-only choices must not leak into fused prefill or later executors."""
+    ext, torch, cpu, config, mask, qw, scales = setup
+    generator = torch.Generator().manual_seed(20261014)
+    qw.copy_(torch.randint(-(1 << 31), (1 << 31) - 1, qw.shape,
+                           dtype=torch.int32, generator=generator))
+    scales.fill_(0.003)
+    monkeypatch.setenv('KT_SYCL_XMX_GRAPH', '0')
+    monkeypatch.setenv('KT_SYCL_XMX_HOST_QUANT', host_quant)
+    monkeypatch.setenv('KT_SYCL_XMX_GATE_SPLITS', '2')
+    monkeypatch.setenv('KT_SYCL_XMX_DOWN_SPLITS', '2')
+    monkeypatch.setenv('KT_SYCL_XMX_GATE_KERNEL', 'xmx')
+    monkeypatch.setenv('KT_SYCL_XMX_DOWN_KERNEL', 'xmx')
+    monkeypatch.setenv('KT_SYCL_XMX_DECODE_GATE_KERNEL', decode_gate)
+    monkeypatch.setenv('KT_SYCL_XMX_DECODE_DOWN_KERNEL', decode_down)
+    monkeypatch.setenv('KT_SYCL_XMX_FUSED_QUANT', 'prefill')
+    selected = ext.moe.SYCLXMXGPTQInt4_MOE(config)
+    cpu.submit(selected.load_weights_task()); cpu.sync()
+
+    monkeypatch.setenv('KT_SYCL_XMX_DECODE_GATE_KERNEL', 'inherit')
+    monkeypatch.setenv('KT_SYCL_XMX_DECODE_DOWN_KERNEL', 'inherit')
+    for rows in (1, 17):
+        # The explicit reference matches this stage. It also changes the
+        # environment after selected captured its own immutable choices.
+        monkeypatch.setenv('KT_SYCL_XMX_GATE_KERNEL', decode_gate if rows == 1 else 'xmx')
+        monkeypatch.setenv('KT_SYCL_XMX_DOWN_KERNEL', decode_down if rows == 1 else 'xmx')
+        monkeypatch.setenv('KT_SYCL_XMX_FUSED_QUANT', '0' if rows == 1 else 'prefill')
+        explicit = ext.moe.SYCLXMXGPTQInt4_MOE(config)
+        cpu.submit(explicit.load_weights_task()); cpu.sync()
+        x = torch.randn(rows, 128, generator=generator).bfloat16()
+        ids = torch.randint(0, 4, (rows, 2), generator=generator)
+        weights = torch.softmax(torch.randn(rows, 2, generator=generator), 1)
+        qlen = torch.tensor([rows], dtype=torch.int32)
+        outputs = []
+        for moe in (selected, explicit):
+            out = torch.empty_like(x)
+            cpu.submit(moe.forward_task(qlen.data_ptr(), 2, ids.data_ptr(), weights.data_ptr(),
+                                       x.data_ptr(), out.data_ptr(), False))
+            cpu.sync()
+            outputs.append(out)
+        torch.testing.assert_close(*outputs, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize('mode,quant_fusion', [('fp16', '0'), ('int8', '0'), ('int8', '1'), ('int8', 'prefill')])
+@pytest.mark.parametrize('graph', ['0', '1'])
+@pytest.mark.parametrize('topk', [1, 2, 8])
+def test_fused_decode_merge_matches_separate_with_dynamic_routes(setup, monkeypatch, mode, quant_fusion, graph, topk):
+    ext, torch, cpu, config, mask, qw, scales = setup
+    config.num_experts_per_tok = topk
+    generator = torch.Generator().manual_seed(108)
+    qw.copy_(torch.randint(-(1 << 31), (1 << 31) - 1, qw.shape,
+                           dtype=torch.int32, generator=generator))
+    scales.fill_(0.003)
+    monkeypatch.setenv('KT_SYCL_XMX_MODE', mode)
+    monkeypatch.setenv('KT_SYCL_XMX_GRAPH', graph)
+    monkeypatch.setenv('KT_SYCL_XMX_DECODE_DOWN_KERNEL', 'xmx')
+    monkeypatch.setenv('KT_SYCL_XMX_FUSED_QUANT', quant_fusion)
+    monkeypatch.setenv('KT_SYCL_XMX_DECODE_MERGE', 'separate')
+    separate = ext.moe.SYCLXMXGPTQInt4_MOE(config)
+    monkeypatch.setenv('KT_SYCL_XMX_DECODE_MERGE', 'fused')
+    fused = ext.moe.SYCLXMXGPTQInt4_MOE(config)
+    for moe in (separate, fused):
+        cpu.submit(moe.load_weights_task()); cpu.sync()
+    for ids_list in ([0, 1], [1, 1], [-1, 1], [3, 0], [-1, -1], [99, 2]):
+        for rows in (1, 17):
+            x = torch.randn(rows, 128, generator=generator).bfloat16()
+            expanded = (ids_list * ((topk + 1) // 2))[:topk]
+            ids = torch.tensor([expanded] * rows, dtype=torch.int64)
+            weights = torch.softmax(torch.randn(rows, topk, generator=generator), 1)
+            qlen = torch.tensor([rows], dtype=torch.int32)
+            outputs = []
+            for moe in (separate, fused):
+                out = torch.randn(rows, 128, generator=generator).bfloat16()
+                cpu.submit(moe.forward_task(qlen.data_ptr(), topk, ids.data_ptr(), weights.data_ptr(),
+                                           x.data_ptr(), out.data_ptr(), False)); cpu.sync()
+                outputs.append(out.clone())
+                previous = out.clone()
+                cpu.submit(moe.forward_task(qlen.data_ptr(), topk, ids.data_ptr(), weights.data_ptr(),
+                                           x.data_ptr(), out.data_ptr(), True)); cpu.sync()
+                torch.testing.assert_close(out, (previous.float() * 2).bfloat16(), rtol=0, atol=0)
+            torch.testing.assert_close(*outputs, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize('name,value', [('KT_SYCL_XMX_TRACE', 'yes'), ('KT_SYCL_XMX_DECODE_MERGE', 'auto'),
+                                      ('KT_SYCL_XMX_TRACE_EVERY', '-1')])
+def test_invalid_pipeline_options_are_rejected(setup, monkeypatch, name, value):
+    ext, _, _, config, *_ = setup
+    monkeypatch.setenv(name, value)
+    with pytest.raises(RuntimeError, match=name):
+        ext.moe.SYCLXMXGPTQInt4_MOE(config)
+
+
+def test_fused_merge_rejects_unsupported_down_kernel(setup, monkeypatch):
+    ext, _, _, config, *_ = setup
+    monkeypatch.setenv('KT_SYCL_XMX_DECODE_MERGE', 'fused')
+    monkeypatch.setenv('KT_SYCL_XMX_DECODE_DOWN_KERNEL', 'vector')
+    with pytest.raises(RuntimeError, match='DECODE_MERGE'):
+        ext.moe.SYCLXMXGPTQInt4_MOE(config)
+
+
+def test_host_profile_snapshot_reset_and_zero_routes(setup, monkeypatch):
+    ext, torch, cpu, config, mask, qw, scales = setup
+    monkeypatch.setenv('KT_SYCL_XMX_TRACE', 'host')
+    monkeypatch.setenv('KT_SYCL_XMX_DECODE_MERGE', 'separate')
+    moe = ext.moe.SYCLXMXGPTQInt4_MOE(config)
+    cpu.submit(moe.load_weights_task()); cpu.sync()
+    for row_count, expert in ((1, 0), (17, -1)):
+        rows = torch.tensor([row_count], dtype=torch.int32)
+        ids = torch.full((row_count, 2), expert, dtype=torch.int64)
+        weights = torch.full((row_count, 2), .5)
+        x = torch.ones(row_count, 128, dtype=torch.bfloat16)
+        out = torch.empty_like(x)
+        cpu.submit(moe.forward_task(rows.data_ptr(), 2, ids.data_ptr(), weights.data_ptr(),
+                                   x.data_ptr(), out.data_ptr(), False)); cpu.sync()
+    stats = moe.profile_snapshot()
+    assert stats['decode.calls'] == stats['prefill.calls'] == 1
+    assert stats['decode.routed'] == 2 and stats['prefill.routed'] == 0
+    assert stats['decode.host_executor_us'] > 0
+    assert stats['decode.host_wrapper_us'] >= stats['decode.host_bf16_us']
+    assert not any('device_' in key for key in stats)
+    moe.reset_profile()
+    assert moe.profile_snapshot() == {}
+
+
+def test_fused_merge_rejects_topk_above_eight(setup, monkeypatch):
+    ext, _, _, config, *_ = setup
+    config.num_experts_per_tok = 9
+    monkeypatch.setenv('KT_SYCL_XMX_DECODE_MERGE', 'fused')
+    with pytest.raises(RuntimeError, match='topk<=8'):
+        ext.moe.SYCLXMXGPTQInt4_MOE(config)
+
+
+def test_device_trace_requires_profiled_queue(setup, monkeypatch):
+    ext, _, _, config, *_ = setup
+    monkeypatch.setenv('KT_SYCL_XMX_TRACE', 'device')
+    # The queue property is fixed by this process's first creation.
+    if os.getenv('KT_SYCL_PROFILE') == '1':
+        pytest.skip('Queue profiling was explicitly enabled for this test process')
+    with pytest.raises(RuntimeError, match='requires KT_SYCL_PROFILE=1'):
+        ext.moe.SYCLXMXGPTQInt4_MOE(config)

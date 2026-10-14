@@ -9,7 +9,8 @@
 
 #include "../avx2/avx2_bf16_utils.hpp"
 #include "../moe-tp.hpp"
-#include "gptq_int4_xmx-kernels.hpp"
+#include "gptq_int4_vector-kernels.hpp"
+#include "gptq_int4_xmx-profile.hpp"
 
 // Dedicated single-NUMA executor. No CPU expert-input pools or FP16 weight copy.
 class SYCL_XMX_GPTQ_INT4_MOE_TP {
@@ -17,7 +18,7 @@ class SYCL_XMX_GPTQ_INT4_MOE_TP {
   using input_t = ggml_bf16_t;
   using output_t = float;
   GeneralMOEConfig config;
-  explicit SYCL_XMX_GPTQ_INT4_MOE_TP(GeneralMOEConfig c, int part = 0) : config(c) {
+  explicit SYCL_XMX_GPTQ_INT4_MOE_TP(GeneralMOEConfig c, int part = 0) : config(c), profile_(std::getenv("KT_SYCL_XMX_TRACE"), c.layer_idx) {
     if (part != 0 || c.pool->config.subpool_count != 1)
       throw std::runtime_error("SYCL XMX currently requires one CPU threadpool/NUMA part");
     if (c.quant_config.bits != 4 || c.quant_config.zero_point)
@@ -34,6 +35,20 @@ class SYCL_XMX_GPTQ_INT4_MOE_TP {
     std::string value = mode ? mode : "fp16";
     if (value != "fp16" && value != "int8") throw std::runtime_error("KT_SYCL_XMX_MODE must be fp16 or int8");
     q8_ = value == "int8";
+    gate_kernel_ = parse_kernel("KT_SYCL_XMX_GATE_KERNEL", Kernel::XMX);
+    down_kernel_ = parse_kernel("KT_SYCL_XMX_DOWN_KERNEL", Kernel::XMX);
+    decode_gate_ = parse_kernel("KT_SYCL_XMX_DECODE_GATE_KERNEL", gate_kernel_);
+    decode_down_ = parse_kernel("KT_SYCL_XMX_DECODE_DOWN_KERNEL", down_kernel_);
+    vector_splits_ = parse_splits("KT_SYCL_XMX_VECTOR_SPLITS", 4);
+    gate_splits_ = parse_splits("KT_SYCL_XMX_GATE_SPLITS", vector_splits_);
+    down_splits_ = parse_splits("KT_SYCL_XMX_DOWN_SPLITS", vector_splits_);
+    const char* merge = std::getenv("KT_SYCL_XMX_DECODE_MERGE");
+    const std::string merge_mode = merge ? merge : "separate";
+    if (merge_mode != "separate" && merge_mode != "fused")
+      throw std::runtime_error("KT_SYCL_XMX_DECODE_MERGE must be separate or fused");
+    fused_merge_ = merge_mode == "fused";
+    if (fused_merge_ && (c.num_experts_per_tok > 8 || decode_down_ != Kernel::XMX))
+      throw std::runtime_error("KT_SYCL_XMX_DECODE_MERGE=fused requires topk<=8 and unsplit XMX decode down");
     const char* tile_rows = std::getenv("KT_SYCL_XMX_ROWS");
     std::string tile = tile_rows ? tile_rows : "8";
     if (tile != "1" && tile != "2" && tile != "4" && tile != "8")
@@ -52,8 +67,12 @@ class SYCL_XMX_GPTQ_INT4_MOE_TP {
       throw std::runtime_error("KT_SYCL_XMX_FUSED_QUANT must be 0, 1 or prefill");
     fused_quant_ = fq && std::string(fq) != "0";
     fused_decode_ = fq && std::string(fq) == "1";
-    if (fused_quant_ && (!q8_ || gs != 128 || c.intermediate_size % 128))
-      throw std::runtime_error("SYCL XMX fused quantization requires int8 mode and group_size=128");
+    if (fused_quant_ &&
+        (!q8_ || gs != 128 || c.intermediate_size % 128 || gate_kernel_ != Kernel::XMX || !uses_q8(down_kernel_) ||
+         (fused_decode_ && (decode_gate_ != Kernel::XMX || !uses_q8(decode_down_)))))
+      throw std::runtime_error("SYCL XMX fused quantization requires int8 XMX gate, quantized down and group_size=128");
+    if (use_graph_ && profile_.device)
+      throw std::runtime_error("KT_SYCL_XMX_TRACE=device does not profile recorded graph nodes; use TRACE=host or GRAPH=0");
     if (use_graph_ && !device.has(sycl::aspect::ext_oneapi_limited_graph))
       throw std::runtime_error("SYCL XMX command graph is unavailable on this device");
     const int max_rows = c.max_possible_qlen();
@@ -76,13 +95,17 @@ class SYCL_XMX_GPTQ_INT4_MOE_TP {
     slot_rows_.reserve(max_routed);
     routing_.reserve(max_routed);
     tiles_.reserve(max_routed);
-    if (q8_) {
+    if (uses_q8(gate_kernel_) || uses_q8(decode_gate_)) {
       qi_.reserve(static_cast<size_t>(max_rows) * c.hidden_size);
-      qm_.reserve(static_cast<size_t>(max_routed) * c.intermediate_size);
       si_.reserve(static_cast<size_t>(max_rows) * c.hidden_size / gs);
+    }
+    if (uses_q8(down_kernel_) || uses_q8(decode_down_)) {
+      qm_.reserve(static_cast<size_t>(max_routed) * c.intermediate_size);
       sm_.reserve(static_cast<size_t>(max_routed) * c.intermediate_size / gs);
     }
     printf("Created SYCL_XMX_GPTQ_INT4_MOE mode=%s layer=%d\n", value.c_str(), c.layer_idx);
+    printf("SYCL projection kernels prefill=%s/%s decode=%s/%s splits=%d/%d\n", kernel_name(gate_kernel_),
+           kernel_name(down_kernel_), kernel_name(decode_gate_), kernel_name(decode_down_), gate_splits_, down_splits_);
   }
 
   void load_weights(const GeneralMOEConfig& source) {
@@ -119,6 +142,10 @@ class SYCL_XMX_GPTQ_INT4_MOE_TP {
     if (rows == 0) return;
     if (loaded_.empty()) throw std::runtime_error("XMX weights not loaded");
     const int h = config.hidden_size, i = config.intermediate_size;
+    using P = sycl_xmx::PipelineProfile;
+    const auto begin = profile_.enabled ? P::Clock::now() : P::Time{};
+    auto checkpoint = begin;
+    if (profile_.enabled) frame_ = {};
     std::fill(counts_.begin(), counts_.end(), 0);
     std::fill(slot_rows_.data, slot_rows_.data + rows * topk, -1);
     for (int slot = 0; slot < rows * topk; ++slot) {
@@ -142,13 +169,29 @@ class SYCL_XMX_GPTQ_INT4_MOE_TP {
       for (int r = 0; r < counts_[e]; r += tile_rows)
         tiles_.data[nt++] = {e, offsets_[e] + r, std::min(tile_rows, counts_[e] - r)};
     }
+    if (profile_.enabled) {
+      const auto now = P::Clock::now();
+      frame_.host[P::Route] = P::us(checkpoint, now);
+      frame_.routed = routed;
+      frame_.tiles = nt;
+      checkpoint = now;
+    }
     if (nt == 0) {
       std::fill_n(static_cast<float*>(output), static_cast<size_t>(rows) * h, 0.0f);
+      if (profile_.enabled) {
+        frame_.host[P::Executor] = P::us(begin, P::Clock::now());
+        profile_.record(rows, frame_);
+      }
       return;
     }
     std::memcpy(input_.data, input, static_cast<size_t>(rows) * h * 2);
     std::memcpy(routing_.data, weights, static_cast<size_t>(rows) * topk * sizeof(float));
-    if (q8_ && host_quant_ && rows == 1) {
+    if (profile_.enabled) {
+      const auto now = P::Clock::now();
+      frame_.host[P::InputCopy] = P::us(checkpoint, now);
+      checkpoint = now;
+    }
+    if (uses_q8(decode_gate_) && host_quant_ && rows == 1) {
       const int gs = config.quant_config.group_size;
       for (int g = 0; g < h / gs; ++g) {
         const auto* src = static_cast<const ggml_bf16_t*>(input) + g * gs;
@@ -172,6 +215,7 @@ class SYCL_XMX_GPTQ_INT4_MOE_TP {
         }
       }
     }
+    if (profile_.enabled) frame_.host[P::HostQuant] = P::us(checkpoint, P::Clock::now());
     try {
       switch (tile_rows) {
         case 1:
@@ -196,13 +240,55 @@ class SYCL_XMX_GPTQ_INT4_MOE_TP {
       }
       throw;
     }
+    if (profile_.enabled) checkpoint = P::Clock::now();
     std::memcpy(output, output_.data, static_cast<size_t>(rows) * h * sizeof(float));
+    if (profile_.enabled) {
+      const auto now = P::Clock::now();
+      frame_.host[P::OutputCopy] = P::us(checkpoint, now);
+      frame_.host[P::Executor] = P::us(begin, now);
+      profile_.record(rows, frame_);
+    }
   }
 
+  sycl_xmx::PipelineProfile& pipeline_profile() { return profile_; }
+
  private:
+  sycl_xmx::PipelineProfile profile_;
+  sycl_xmx::PipelineProfile::Frame frame_;
+  void remember(int stage, const sycl::event& event) {
+    if (profile_.device) {
+      frame_.events[stage] = event;
+      frame_.present[stage] = true;
+    }
+  }
+  enum class Kernel { XMX, XMXSplit, Vector, DP4A };
+  static Kernel parse_kernel(const char* name, Kernel fallback) {
+    const char* value = std::getenv(name);
+    if (!value || std::string(value) == "inherit") return fallback;
+    if (std::string(value) == "xmx") return Kernel::XMX;
+    if (std::string(value) == "xmx-split") return Kernel::XMXSplit;
+    if (std::string(value) == "vector") return Kernel::Vector;
+    if (std::string(value) == "dp4a") return Kernel::DP4A;
+    throw std::runtime_error(std::string(name) + " must be xmx, xmx-split, vector, dp4a or inherit");
+  }
+  static const char* kernel_name(Kernel k) {
+    return k == Kernel::XMX ? "xmx" : k == Kernel::XMXSplit ? "xmx-split" : k == Kernel::Vector ? "vector" : "dp4a";
+  }
+  static int parse_splits(const char* name, int fallback) {
+    const char* value = std::getenv(name);
+    if (!value) return fallback;
+    std::string s(value);
+    if (s == "1" || s == "2" || s == "4" || s == "8") return std::stoi(s);
+    throw std::runtime_error(std::string(name) + " must be 1, 2, 4 or 8");
+  }
+  bool uses_q8(Kernel k) const { return k == Kernel::DP4A || ((k == Kernel::XMX || k == Kernel::XMXSplit) && q8_); }
   bool q8_ = false;
+  Kernel gate_kernel_ = Kernel::XMX, down_kernel_ = Kernel::XMX;
+  Kernel decode_gate_ = Kernel::XMX, decode_down_ = Kernel::XMX;
+  int vector_splits_ = 4, gate_splits_ = 4, down_splits_ = 4;
   int tile_rows_ = 8;
   bool use_graph_ = false;
+  bool fused_merge_ = false;
   bool host_quant_ = false;
   bool fused_quant_ = false;
   bool fused_decode_ = false;
@@ -219,40 +305,97 @@ class SYCL_XMX_GPTQ_INT4_MOE_TP {
   // Executable graphs must be destroyed before the USM storage they reference.
   std::vector<std::unique_ptr<Graph>> graphs_;
 
-  template <int Rows, bool Q8>
-  sycl::event execute(int nt, int rows, int topk, int routed) {
-    sycl::event qi;
-    const bool device_quant = Q8 && !(host_quant_ && rows == 1);
-    const bool use_fused_quant = fused_quant_ && (rows > 1 || fused_decode_);
-    if constexpr (Q8)
-      if (device_quant)
-        qi = sycl_xmx::quantize(input_.data, qi_.data, si_.data, rows, config.hidden_size,
-                                config.quant_config.group_size);
-    sycl::event gu;
-    if constexpr (Q8) {
-      if (use_fused_quant)
-        gu = sycl_xmx::projection<Rows, true, true, true>(
-            tiles_.data, nt, row_tokens_.data, input_.data, qi_.data, si_.data, gate_, &up_, nullptr, nullptr,
-            config.swiglu_limit, config.swiglu_alpha, device_quant ? &qi : nullptr, qm_.data, sm_.data);
+  template <int Rows, bool GateUp>
+  sycl::event submit_projection(Kernel kernel, const sycl::event* dep, int nt, bool fused = false) {
+    const auto& first = GateUp ? gate_ : down_weight_;
+    const auto* second = GateUp ? &up_ : nullptr;
+    const auto* input = GateUp ? input_.data : activated_.data;
+    const auto* quantized = GateUp ? qi_.data : qm_.data;
+    const auto* scales = GateUp ? si_.data : sm_.data;
+    const auto* tokens = GateUp ? row_tokens_.data : nullptr;
+    auto* activated = GateUp ? activated_.data : nullptr;
+    auto* down = GateUp ? nullptr : down_.data;
+    const int splits = GateUp ? gate_splits_ : down_splits_;
+    if (kernel == Kernel::Vector)
+      return sycl_xmx::vector_dispatch<false, GateUp>(splits, tiles_.data, nt, Rows, tokens, input, quantized, scales,
+                                                      first, second, activated, down, config.swiglu_limit,
+                                                      config.swiglu_alpha, dep);
+    if (kernel == Kernel::DP4A)
+      return sycl_xmx::vector_dispatch<true, GateUp>(splits, tiles_.data, nt, Rows, tokens, input, quantized, scales,
+                                                     first, second, activated, down, config.swiglu_limit,
+                                                     config.swiglu_alpha, dep);
+    if (kernel == Kernel::XMXSplit) {
+#define KT_XMX_SPLIT(S)                                                                                                \
+  (q8_ ? sycl_xmx::projection<Rows, true, GateUp, false, S>(tiles_.data, nt, tokens, input, quantized, scales, first,  \
+                                                            second, activated, down, config.swiglu_limit,              \
+                                                            config.swiglu_alpha, dep)                                  \
+       : sycl_xmx::projection<Rows, false, GateUp, false, S>(tiles_.data, nt, tokens, input, quantized, scales, first, \
+                                                             second, activated, down, config.swiglu_limit,             \
+                                                             config.swiglu_alpha, dep))
+      switch (splits) {
+        case 1:
+          return KT_XMX_SPLIT(1);
+        case 2:
+          return KT_XMX_SPLIT(2);
+        case 4:
+          return KT_XMX_SPLIT(4);
+        default:
+          return KT_XMX_SPLIT(8);
+      }
+#undef KT_XMX_SPLIT
     }
-    if (!use_fused_quant)
-      gu = sycl_xmx::projection<Rows, Q8, true>(tiles_.data, nt, row_tokens_.data, input_.data, qi_.data, si_.data,
-                                                gate_, &up_, activated_.data, nullptr, config.swiglu_limit,
-                                                config.swiglu_alpha, device_quant ? &qi : nullptr);
-    sycl::event middle = gu;
-    if constexpr (Q8)
-      if (!use_fused_quant)
-        middle = sycl_xmx::quantize(activated_.data, qm_.data, sm_.data, routed, config.intermediate_size,
-                                    config.quant_config.group_size, &gu);
-    auto d = sycl_xmx::projection<Rows, Q8, false>(tiles_.data, nt, nullptr, activated_.data, qm_.data, sm_.data,
-                                                   down_weight_, nullptr, nullptr, down_.data, 0, 0, &middle);
-    auto result =
-        sycl_xmx::merge(slot_rows_.data, routing_.data, down_.data, output_.data, rows, topk, config.hidden_size, d);
-    return result;
+    if constexpr (GateUp) {
+      if (fused)
+        return sycl_xmx::projection<Rows, true, true, true>(tiles_.data, nt, tokens, input, quantized, scales, first,
+                                                            second, nullptr, nullptr, config.swiglu_limit,
+                                                            config.swiglu_alpha, dep, qm_.data, sm_.data);
+    }
+    return q8_ ? sycl_xmx::projection<Rows, true, GateUp>(tiles_.data, nt, tokens, input, quantized, scales, first,
+                                                          second, activated, down, config.swiglu_limit,
+                                                          config.swiglu_alpha, dep)
+               : sycl_xmx::projection<Rows, false, GateUp>(tiles_.data, nt, tokens, input, quantized, scales, first,
+                                                           second, activated, down, config.swiglu_limit,
+                                                           config.swiglu_alpha, dep);
   }
   template <int Rows>
   sycl::event submit(int nt, int rows, int topk, int routed) {
-    return q8_ ? execute<Rows, true>(nt, rows, topk, routed) : execute<Rows, false>(nt, rows, topk, routed);
+    const Kernel gate = rows == 1 ? decode_gate_ : gate_kernel_;
+    const Kernel down = rows == 1 ? decode_down_ : down_kernel_;
+    const bool device_quant = uses_q8(gate) && !(host_quant_ && rows == 1);
+    const bool use_fused_quant = fused_quant_ && (rows > 1 || fused_decode_);
+    sycl::event qi;
+    if (device_quant)
+      qi =
+          sycl_xmx::quantize(input_.data, qi_.data, si_.data, rows, config.hidden_size, config.quant_config.group_size);
+    if (device_quant) remember(sycl_xmx::PipelineProfile::InputQuant, qi);
+    auto gu = submit_projection<Rows, true>(gate, device_quant ? &qi : nullptr, nt, use_fused_quant);
+    remember(sycl_xmx::PipelineProfile::Gate, gu);
+    sycl::event middle = gu;
+    if (uses_q8(down) && !use_fused_quant) {
+      middle = sycl_xmx::quantize(activated_.data, qm_.data, sm_.data, routed, config.intermediate_size,
+                                  config.quant_config.group_size, &gu);
+      remember(sycl_xmx::PipelineProfile::MiddleQuant, middle);
+    }
+    if constexpr (Rows == 1) {
+      if (rows == 1 && fused_merge_) {
+        auto result = q8_ ? sycl_xmx::projection<1, true, false, false, 1, true>(
+                               tiles_.data, nt, nullptr, activated_.data, qm_.data, sm_.data, down_weight_, nullptr,
+                               nullptr, nullptr, 0, 0, &middle, nullptr, nullptr, slot_rows_.data, routing_.data,
+                               output_.data, topk)
+                          : sycl_xmx::projection<1, false, false, false, 1, true>(
+                               tiles_.data, nt, nullptr, activated_.data, qm_.data, sm_.data, down_weight_, nullptr,
+                               nullptr, nullptr, 0, 0, &middle, nullptr, nullptr, slot_rows_.data, routing_.data,
+                               output_.data, topk);
+        // Down includes expert merge; no separate Merge event is recorded.
+        remember(sycl_xmx::PipelineProfile::Down, result);
+        return result;
+      }
+    }
+    auto d = submit_projection<Rows, false>(down, &middle, nt);
+    remember(sycl_xmx::PipelineProfile::Down, d);
+    auto result = sycl_xmx::merge(slot_rows_.data, routing_.data, down_.data, output_.data, rows, topk, config.hidden_size, d);
+    remember(sycl_xmx::PipelineProfile::Merge, result);
+    return result;
   }
   template <int Rows>
   void run(int nt, int rows, int topk, int routed) {
@@ -273,13 +416,27 @@ class SYCL_XMX_GPTQ_INT4_MOE_TP {
           graph.end_recording();
           cached = std::make_unique<Graph>(graph.finalize());
         }
+        using P = sycl_xmx::PipelineProfile;
+        const auto begin = profile_.enabled ? P::Clock::now() : P::Time{};
         auto result = q.ext_oneapi_graph(*cached);
+        const auto submitted = profile_.enabled ? P::Clock::now() : P::Time{};
         sycl_int4::wait_and_throw(result);
+        if (profile_.enabled) {
+          frame_.host[P::Submit] = P::us(begin, submitted);
+          frame_.host[P::Wait] = P::us(submitted, P::Clock::now());
+        }
         return;
       }
     }
+    using P = sycl_xmx::PipelineProfile;
+    const auto begin = profile_.enabled ? P::Clock::now() : P::Time{};
     auto result = submit<Rows>(nt, rows, topk, routed);
+    const auto submitted = profile_.enabled ? P::Clock::now() : P::Time{};
     sycl_int4::wait_and_throw(result);
+    if (profile_.enabled) {
+      frame_.host[P::Submit] = P::us(begin, submitted);
+      frame_.host[P::Wait] = P::us(submitted, P::Clock::now());
+    }
   }
 };
 
@@ -301,6 +458,9 @@ class TP_MOE<SYCL_XMX_GPTQ_INT4_MOE_TP> : public TP_MOE_Common<SYCL_XMX_GPTQ_INT
   void forward(int rows, int topk, const int64_t* ids, const float* weights, const void* input, void* output,
                bool incremental = false) override {
     if (!this->weights_loaded) throw std::runtime_error("XMX weights not loaded");
+    using P = sycl_xmx::PipelineProfile;
+    auto& profile = this->tps[0]->pipeline_profile();
+    const auto begin = profile.enabled ? P::Clock::now() : P::Time{};
     if (use_numa_dispatch_) {
       // Worker exceptions must be captured here: the generic NUMA distributor
       // does not propagate exceptions from its worker threads.
@@ -316,8 +476,15 @@ class TP_MOE<SYCL_XMX_GPTQ_INT4_MOE_TP> : public TP_MOE_Common<SYCL_XMX_GPTQ_INT
     } else {
       this->tps[0]->forward(rows, topk, ids, weights, input, this->local_output_numa[0]);
     }
+    const auto converted = profile.enabled ? P::Clock::now() : P::Time{};
     merge_results(rows, output, incremental);
+    if (profile.enabled && rows > 0) {
+      const auto end = P::Clock::now();
+      profile.record_wrapper(rows, P::us(begin, end), P::us(converted, end));
+    }
   }
+  std::map<std::string, double> profile_snapshot() { return this->tps[0]->pipeline_profile().snapshot(); }
+  void reset_profile() { this->tps[0]->pipeline_profile().reset(); }
   void forward_binding(intptr_t rows, int topk, intptr_t ids, intptr_t weights, intptr_t input, intptr_t output,
                        bool incremental) {
     if (!rows) throw std::runtime_error("XMX qlen pointer is null");

@@ -1,5 +1,9 @@
 # Panther Lake iGPU 专用 GPTQ INT4 XMX 后端（实验性）
 
+第二阶段的向量 GEMV/DP4A 候选、同调度比较和无子模块修改构建选项见 [投影候选说明](SYCL-IGPU-Projection-Candidates_zh.md)。第一版默认计算路径保持不变。
+
+第三阶段的分段测量、NVIDIA pinned 数据交接对照与 down/merge 融合候选见 [执行链说明](SYCL-IGPU-Pipeline_zh.md)。
+
 该后端仍运行在 KTransformers 的混合推理框架中：NVIDIA GPU 执行 attention、dense 算子和配置在 CUDA 上的专家；Intel iGPU 执行其余 routed experts。它不是纯 iGPU 模型执行器，也没有把 OpenVINO 或 llama.cpp 作为运行时依赖。
 
 旧 SYCL 后端仍为默认值。新后端必须显式选择，便于回退和比较。

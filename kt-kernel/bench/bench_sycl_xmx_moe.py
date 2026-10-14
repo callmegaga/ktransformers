@@ -70,6 +70,7 @@ def main():
     p.add_argument('--threads', type=int, default=10)
     p.add_argument('--repeat', type=int, default=10)
     p.add_argument('--warmup', type=int, default=3)
+    p.add_argument('--route-sets', type=int, default=1, help='Rotate expert assignments; 1 measures fixed-route reuse')
     p.add_argument('--swiglu-limit', type=float, default=0.0)
     p.add_argument('--swiglu-alpha', type=float, default=0.0)
     p.add_argument('--check', action='store_true')
@@ -77,9 +78,10 @@ def main():
     p.add_argument('--output', type=Path)
     args = p.parse_args()
     backends = args.backends.split(',')
-    if not set(backends) <= {'legacy', 'packed', 'avx2', 'xmx-fp16', 'xmx-int8'}:
+    if not set(backends) <= {'legacy', 'packed', 'avx2', 'xmx-fp16', 'xmx-int8', 'vector', 'dp4a',
+                             'xmx-dp4a', 'dp4a-xmx', 'vector-xmx', 'xmx-vector', 'xmx-split-xmx'}:
         p.error('Unknown backend')
-    if args.repeat <= 0 or args.warmup < 0 or not 0 < args.topk <= args.experts:
+    if args.repeat <= 0 or args.warmup < 0 or args.route_sets <= 0 or not 0 < args.topk <= args.experts:
         p.error('Invalid repetitions or expert count')
     if min(args.hidden, args.intermediate, args.group_size, args.threads) <= 0:
         p.error('Dimensions, group size and thread count must be positive')
@@ -127,7 +129,12 @@ def main():
     cpu = ext.CPUInfer(args.threads)
     results = []
     for backend in backends:
-        os.environ['KT_SYCL_XMX_MODE'] = backend.removeprefix('xmx-') if backend.startswith('xmx-') else 'fp16'
+        kernels = {'vector': ('vector', 'vector'), 'dp4a': ('dp4a', 'dp4a'),
+                   'xmx-dp4a': ('xmx', 'dp4a'), 'dp4a-xmx': ('dp4a', 'xmx'),
+                   'xmx-split-xmx': ('xmx-split', 'xmx'),
+                   'vector-xmx': ('vector', 'xmx'), 'xmx-vector': ('xmx', 'vector')}.get(backend, ('xmx', 'xmx'))
+        os.environ['KT_SYCL_XMX_GATE_KERNEL'], os.environ['KT_SYCL_XMX_DOWN_KERNEL'] = kernels
+        os.environ['KT_SYCL_XMX_MODE'] = 'fp16' if backend in ('vector', 'xmx-fp16', 'legacy', 'packed', 'avx2') else 'int8'
         cls = {'legacy': 'SYCLGPTQInt4_MOE', 'packed': 'AVXVNNI256GPTQInt4Packed_MOE',
                'avx2': 'AVX2GPTQInt4_MOE'}.get(backend, 'SYCLXMXGPTQInt4_MOE')
         config = ext.moe.MOEConfig(args.experts, args.topk, args.hidden, args.intermediate, mask.data_ptr())
@@ -146,22 +153,30 @@ def main():
         for rows, x, ids, weights in cases:
             out = torch.zeros_like(x)
             qlen = torch.tensor([rows], dtype=torch.int32)
-            def run(incremental=False):
-                cpu.submit(moe.forward_task(qlen.data_ptr(), args.topk, ids.data_ptr(), weights.data_ptr(), x.data_ptr(), out.data_ptr(), incremental))
+            routes = [torch.where(ids >= 0, (ids + index * args.topk) % args.experts, ids).contiguous()
+                      for index in range(args.route_sets)]
+            def run(incremental=False, route=0):
+                cpu.submit(moe.forward_task(qlen.data_ptr(), args.topk, routes[route].data_ptr(), weights.data_ptr(), x.data_ptr(), out.data_ptr(), incremental))
                 cpu.sync()
             for _ in range(args.warmup): run()
             times = []
-            for _ in range(args.repeat):
-                start = time.perf_counter_ns(); run(); times.append((time.perf_counter_ns() - start) / 1e6)
+            for index in range(args.repeat):
+                start = time.perf_counter_ns(); run(route=index % args.route_sets); times.append((time.perf_counter_ns() - start) / 1e6)
             record = {'backend': backend, 'rows': rows, 'median_ms': statistics.median(times), 'min_ms': min(times), 'samples_ms': times}
+            record['kernels'] = {key: os.getenv(key) for key in ('KT_SYCL_XMX_MODE', 'KT_SYCL_XMX_GATE_KERNEL',
+                'KT_SYCL_XMX_DOWN_KERNEL', 'KT_SYCL_XMX_DECODE_GATE_KERNEL', 'KT_SYCL_XMX_DECODE_DOWN_KERNEL',
+                'KT_SYCL_XMX_GATE_SPLITS', 'KT_SYCL_XMX_DOWN_SPLITS', 'KT_SYCL_XMX_DECODE_MERGE',
+                'KT_SYCL_XMX_TRACE')}
             if args.check:
+                run()  # Compare the base route, separately from timed requests.
                 ref = refs[rows]
                 error = out.float() - ref
                 record.update(relative_rmse=(error.square().mean().sqrt() / ref.square().mean().sqrt().clamp_min(1e-12)).item(),
                               max_abs_error=error.abs().max().item(), finite=bool(torch.isfinite(out).all()))
-                if not record['finite'] or record['relative_rmse'] > (0.08 if backend in ('packed', 'xmx-int8') else 0.025):
+                quantized = backend not in ('legacy', 'avx2', 'vector', 'xmx-fp16')
+                if not record['finite'] or record['relative_rmse'] > (0.08 if quantized else 0.025):
                     raise AssertionError(f'correctness failed: {record}')
-                if args.edge_cases and backend.startswith('xmx'):
+                if args.edge_cases and backend not in ('legacy', 'packed', 'avx2'):
                     previous = out.clone(); run(incremental=True)
                     expected = (previous.float() * 2).bfloat16()
                     torch.testing.assert_close(out, expected, rtol=0.02, atol=0.002)
@@ -174,6 +189,10 @@ def main():
         environment = {key: os.getenv(key) for key in ('KT_SYCL_XMX_MODE', 'KT_SYCL_XMX_ROWS', 'KT_SYCL_XMX_GRAPH',
                                                        'KT_SYCL_XMX_HOST_QUANT', 'KT_SYCL_XMX_FUSED_QUANT',
                                                        'KT_SYCL_XMX_NUMA_DISPATCH',
+                                                       'KT_SYCL_XMX_GATE_KERNEL', 'KT_SYCL_XMX_DOWN_KERNEL',
+                                                       'KT_SYCL_XMX_DECODE_GATE_KERNEL', 'KT_SYCL_XMX_DECODE_DOWN_KERNEL',
+                                                       'KT_SYCL_XMX_VECTOR_SPLITS', 'KT_SYCL_XMX_GATE_SPLITS', 'KT_SYCL_XMX_DOWN_SPLITS',
+                                                       'KT_SYCL_XMX_DECODE_MERGE', 'KT_SYCL_XMX_TRACE', 'KT_SYCL_XMX_TRACE_EVERY', 'KT_SYCL_PROFILE',
                                                        'ONEAPI_DEVICE_SELECTOR')}
         args.output.write_text(json.dumps({'config': config, 'environment': environment, 'results': results}, indent=2))
 

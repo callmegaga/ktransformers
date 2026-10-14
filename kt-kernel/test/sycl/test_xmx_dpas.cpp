@@ -53,7 +53,7 @@ void check_signed_dpas() {
   std::cout << "signed DPAS M=" << M << " passed\n";
 }
 
-template <bool Q8>
+template <bool Q8, int Splits = 1>
 void check_projection() {
   constexpr int K = 128, N = 32, GS = 32, R = 3;
   std::mt19937 gen(123);
@@ -83,8 +83,8 @@ void check_projection() {
     }
   for (int r = 0; r < R; ++r)
     for (int g = 0; g < K / GS; ++g) sa.data[r * K / GS + g] = (g + 1) * 0.2f;
-  auto event = sycl_xmx::projection<8, Q8, false>(tile.data, 1, nullptr, input.data, qi.data, sa.data, weight, nullptr,
-                                                  nullptr, output.data, 0, 0);
+  auto event = sycl_xmx::projection<8, Q8, false, false, Splits>(tile.data, 1, nullptr, input.data, qi.data, sa.data,
+                                                                 weight, nullptr, nullptr, output.data, 0, 0);
   sycl_int4::wait_and_throw(event);
   for (int r = 0; r < R; ++r)
     for (int n = 0; n < N; ++n) {
@@ -117,6 +117,12 @@ int main() {
     check_signed_dpas<8>();
     check_projection<false>();
     check_projection<true>();
+    check_projection<false, 2>();
+    check_projection<true, 2>();
+    check_projection<false, 4>();
+    check_projection<true, 4>();
+    check_projection<false, 8>();
+    check_projection<true, 8>();
   } catch (const std::exception& e) {
     std::cerr << e.what() << '\n';
     return 1;

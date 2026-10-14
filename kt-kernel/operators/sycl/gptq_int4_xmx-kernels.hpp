@@ -110,13 +110,17 @@ inline sycl::event quantize(const uint16_t* src, int8_t* dst, float* scales, int
   });
 }
 
-template <int Rows, bool Q8, bool GateUp, bool FusedQuant = false>
+template <int Rows, bool Q8, bool GateUp, bool FusedQuant = false, int KSplits = 1, bool FusedMerge = false>
 inline sycl::event projection(const Tile* tiles, int tile_count, const int* row_tokens, const uint16_t* input,
                               const int8_t* qinput, const float* ascales, const Weight& first, const Weight* second,
                               uint16_t* activated, float* down, float limit, float alpha,
                               const sycl::event* dep = nullptr, int8_t* qoutput = nullptr,
-                              float* output_scales = nullptr) {
+                              float* output_scales = nullptr, const int* merge_slots = nullptr,
+                              const float* routing = nullptr, float* merged = nullptr, int topk = 0) {
   static_assert(!FusedQuant || (Q8 && GateUp));
+  static_assert(KSplits == 1 || KSplits == 2 || KSplits == 4 || KSplits == 8);
+  static_assert(!FusedQuant || KSplits == 1);
+  static_assert(!FusedMerge || (Rows == 1 && !GateUp && !FusedQuant && KSplits == 1));
   const int n = first.n, k = first.k, gs = first.gs, groups = k / gs;
   const uint32_t* w0 = first.packed.data;
   const float* s0 = first.scales.data;
@@ -124,12 +128,15 @@ inline sycl::event projection(const Tile* tiles, int tile_count, const int* row_
   const float* s1 = second ? second->scales.data : nullptr;
   auto compute = [=](size_t index, int lane) SYCL_ESIMD_FUNCTION {
     if constexpr (FusedQuant) es::slm_init<Rows * 8 * sizeof(float)>();
+    if constexpr (FusedMerge) es::slm_init<8 * 16 * sizeof(float)>();
+    if constexpr (KSplits > 1) es::slm_init<Rows * 16 * KSplits * sizeof(float) * (GateUp ? 2 : 1)>();
     const int nb = index % (n / 16);
-    const Tile tile = tiles[index / (n / 16)];
+    const bool valid = !FusedMerge || index / (n / 16) < static_cast<size_t>(tile_count);
+    const Tile tile = valid ? tiles[index / (n / 16)] : Tile{0, 0, 0};
     const size_t wi = (static_cast<size_t>(tile.expert) * (n / 16) + nb) * (k / 8) * 16;
     const size_t si = (static_cast<size_t>(tile.expert) * (n / 16) + nb) * groups * 16;
     es::simd<float, Rows * 16> acc0 = 0.0f, acc1 = 0.0f;
-    for (int g = 0; g < groups; ++g) {
+    for (int g = KSplits > 1 ? lane : 0; g < (valid ? groups : 0); g += KSplits) {
       es::simd<float, 16> sc0;
       sc0.copy_from(s0 + si + g * 16);
       es::simd<float, 16> sc1;
@@ -192,6 +199,20 @@ inline sycl::event projection(const Tile* tiles, int tile_count, const int* row_
       }
       // Groups carry distinct scales; integer accumulation never crosses them.
     }
+    if constexpr (KSplits > 1) {
+      constexpr int bytes = Rows * 16 * sizeof(float);
+      es::slm_block_store<float, Rows * 16>(lane * bytes, acc0);
+      if constexpr (GateUp) es::slm_block_store<float, Rows * 16>((KSplits + lane) * bytes, acc1);
+      es::barrier();
+      if (lane != 0) return;
+      acc0 = 0.0f;
+      acc1 = 0.0f;
+#pragma unroll
+      for (int split = 0; split < KSplits; ++split) {
+        acc0 += es::slm_block_load<float, Rows * 16>(split * bytes);
+        if constexpr (GateUp) acc1 += es::slm_block_load<float, Rows * 16>((KSplits + split) * bytes);
+      }
+    }
 #pragma unroll
     for (int r = 0; r < Rows; ++r) {
       if (r >= tile.rows) continue;
@@ -219,7 +240,28 @@ inline sycl::event projection(const Tile* tiles, int tile_count, const int* row_
       } else {
         es::simd<uint32_t, 16> u = es::convert<uint32_t>(bf) << 16;
         es::simd<float, 16> rounded = u.template bit_cast_view<float>();
-        rounded.copy_to(down + static_cast<size_t>(tile.begin + r) * n + nb * 16);
+        if constexpr (FusedMerge)
+          acc0 = rounded;
+        else
+          rounded.copy_to(down + static_cast<size_t>(tile.begin + r) * n + nb * 16);
+      }
+    }
+    if constexpr (FusedMerge) {
+      // Decode tiles have exactly one row. Eight work-items own a column
+      // block across routed rows, keeping BF16 rounding before slot weights.
+      // Inactive padded lanes still reach the work-group barrier.
+      es::slm_block_store<float, 16>(lane * 16 * sizeof(float), acc0);
+      es::barrier();
+      if (lane == 0) {
+        es::simd<float, 16> sum = 0.0f;
+        for (int slot = 0; slot < topk; ++slot) {
+          const int row = merge_slots[slot];
+          if (row >= 0) {
+            const auto values = es::slm_block_load<float, 16>(row * 16 * sizeof(float));
+            sum += values * routing[slot];
+          }
+        }
+        sum.copy_to(merged + nb * 16);
       }
     }
     if constexpr (FusedQuant) {
@@ -241,9 +283,18 @@ inline sycl::event projection(const Tile* tiles, int tile_count, const int* row_
   return sycl_int4::queue().submit([&](sycl::handler& h) {
     if (dep) h.depends_on(*dep);
     const size_t work = static_cast<size_t>(tile_count) * (n / 16);
-    if constexpr (FusedQuant) {
+    if constexpr (FusedMerge) {
+      h.parallel_for(sycl::nd_range<1>(static_cast<size_t>(n / 16) * 8, 8), [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
+        const int lane = it.get_local_linear_id();
+        compute(static_cast<size_t>(lane) * (n / 16) + it.get_group_linear_id(), lane);
+      });
+    } else if constexpr (FusedQuant) {
       h.parallel_for(sycl::nd_range<1>(work, 8), [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
         compute(it.get_global_linear_id(), it.get_local_linear_id());
+      });
+    } else if constexpr (KSplits > 1) {
+      h.parallel_for(sycl::nd_range<1>(work * KSplits, KSplits), [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
+        compute(it.get_group_linear_id(), it.get_local_linear_id());
       });
     } else {
       h.parallel_for(sycl::range<1>(work), [=](sycl::id<1> id) SYCL_ESIMD_KERNEL { compute(id[0], 0); });

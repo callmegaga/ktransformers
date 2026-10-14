@@ -483,6 +483,11 @@ void bind_moe_module(py::module_& moe_module, const char* name) {
       .def("load_weights", &MoeClass::load_weights)
       .def("forward", &MoeClass::forward_binding);
 
+  if constexpr (requires(MoeClass& instance) { instance.profile_snapshot(); instance.reset_profile(); }) {
+    moe_cls.def("profile_snapshot", &MoeClass::profile_snapshot)
+        .def("reset_profile", &MoeClass::reset_profile);
+  }
+
   // Bind write_weight_scale_to_buffer_task for MoE types that support it
   // Uses SFINAE to detect if MoeClass has write_weight_scale_to_buffer method
   if constexpr (requires { &MoeClass::write_weight_scale_to_buffer; }) {
