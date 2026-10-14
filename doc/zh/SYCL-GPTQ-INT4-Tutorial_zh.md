@@ -4,6 +4,8 @@
 
 这是一个异构推理方案：Intel iGPU 负责未放在 CUDA GPU 上的 GPTQ INT4 experts；Attention、Embedding、LM Head 以及通过 `--kt-num-gpu-experts` 保留的 experts 仍由 CUDA GPU 执行。因此，当前实现不能替代 NVIDIA GPU，也不是纯 Intel GPU 推理后端。
 
+针对 Panther Lake 的实验性 XMX 实现、选择方式和性能测试见 [XMX 专用后端说明](SYCL-XMX-GPTQ-INT4_zh.md)。旧实现仍为默认值。
+
 ## 目录
 
 - [支持范围](#支持范围)
