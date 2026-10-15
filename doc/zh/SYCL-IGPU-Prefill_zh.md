@@ -100,6 +100,42 @@ KT为对称GPTQ，权重与路由不完全一致。OV对照16输出tokens，表�
 TTFT发生于decode之前，但这些不是严格的固定路由/固定二进制跨框架归因实验。
 OpenVINO的原脚本并没有使用报告中写的512chunk；unlimited是其原实际配置。
 
-这一轮表明已测长prompt输入吞吐超过该OV参考，但后续还需同二进制长输出和反序控制。
+这一首轮表明已测长prompt输入吞吐超过该OV参考；同二进制长输出和反序控制结果见下节。
 详细数据在 `/home/wy/work/kt-perf-log/igpu-prefill-v5/`，OpenVINO调查在
 `/home/wy/work/kt-perf-log/openvino-analysis/20261015/`，不修改原始用户报告。
+
+## 最终同二进制长输出控制
+
+先新配置、后原配置；各档5次、每次300输出tokens，chunk512，关闭trace/profile。
+唯一变化为 prefill tile；两边均使用相同第四阶段整专家decode。
+
+| 输入档位 | 原prefill | 新prefill | 提升 | 原TTFT→新TTFT | 新decode |
+|---|---:|---:|---:|---:|---:|
+|1K|752.51tok/s|1081.07tok/s|+43.66%|1.367→0.952s|40.53tok/s|
+|4K|787.27tok/s|1145.29tok/s|+45.48%|5.209→3.581s|39.38tok/s|
+|7.5K|789.22tok/s|1140.52tok/s|+44.51%|9.738→6.738s|38.37tok/s|
+
+4K新配置逐次输入吞吐1139.6–1148.0tok/s；7.5K为1135.7–1144.3tok/s。
+独立首轮3次短输出与本轮5次长输出结果接近，不依赖单次快样本。
+原配置decode中位数39.84/39.04/38.16tok/s，未观察到本阶段decode退步。
+
+相对今日OpenVINO unlimited预算复测，4K/7.5K输入吞吐高约11.48%/11.10%，
+TTFT分别3.581vs3.992s、6.738vs7.486s。
+**因此本机这组已测工作负载上的prefill追赶目标已经达到。**
+这不是同量化权重的逐算子比较，也不是整个框架/所有输入上更快的证明；
+OV对照为3次16输出，本轮KT为5次300输出，比较的是先于decode发生的TTFT。
+顺序测试仍不能完全消除功耗/温度/频率等影响，广泛工作负载与质量验收另行评估。
+
+## 交付验证
+
+英文/中文/代码三条固定chat提示词，原prefill配置与新prefill配置使用相同整专家decode：
+输入token logprobs平均绝对差均为0，三条64-token greedy输出IDs均相同；
+输出chosen-token logprob平均绝对差约0.0020/0.0077/0.0051，最大约0.0364/0.1554/0.0803。
+概率没有逐位相同，有限提示词不能替代完整PPL/下游质量评估。
+候选侧通过实际交付启动脚本运行，日志核验M8N32/M16N32与整专家decode，
+完成全部请求后服务停止。
+
+外部perf.py回归21passed；所有新开关进入run fingerprint，旧ROWS继承关系受测试覆盖。
+独立DPAS/vector/trace回归、重复副本模式构建与扩展哈希记录在结果目录manifest。
+生产代码checkpoint为 `1a02d06`；默认legacy/staged路径与昨日配置均可即时回退。
+`third_party/llama.cpp`无修改，原OpenVINO结果JSON保持原样。
