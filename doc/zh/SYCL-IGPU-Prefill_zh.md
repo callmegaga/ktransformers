@@ -1,7 +1,8 @@
 # Panther Lake iGPU prefill：M/N 复用与独立投影分块
 
 后续版本见 [v6路由向量读取与专家合并](SYCL-IGPU-Prefill-Loads_zh.md)。本页保留v5的实验与验收记录；
-当前交付脚本默认保留v5；后续v6性能候选需要显式启用。
+当前交付脚本默认使用v6；设置 `KT_IGPU_PREFILL_PROFILE=v5` 可复现本页配置。
+后续数值复核与限制见 [长上下文复核](SYCL-IGPU-Validation_zh.md)。
 
 接续 [整专家 decode 融合](SYCL-IGPU-Fused-Expert_zh.md)。目标是在保持已测约40tok/s
 decode 的前提下，改善 Qwen3.5-35B-A3B-GPTQ-Int4 的长 prompt TTFT，

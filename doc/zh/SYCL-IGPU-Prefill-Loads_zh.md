@@ -5,8 +5,11 @@ RTX5060 Laptop 的 Qwen3.5-35B-A3B-GPTQ-Int4 混合推理配置上，进一步�
 **本阶段没有改变GPTQ权重、group-wise S8激活量化、BF16舍入边界或decode算法。**
 目标是继续逼近本机性能上限，而不是宣称已经达到硬件极限或所有工作负载上的最优。
 
-**当前状态：v6为显式启用的性能候选，默认入口仍为v5。后端算子精度检查通过，但新增长文本
-greedy一致性检查未完全通过，整模型质量验收尚未完成。**
+**2026-10-15 后续复核：交付入口默认使用 v6，可显式回退 v5。**
+原长文本分歧在 v5 自身也可复现；固定输入的 NVIDIA-only Marlin 重放独立复现数值波动，
+而同为 GPU experts=0 的 v5/v6 各 5 次整模型检查结果逐位相同。
+详细证据、限制和未推广的实验见 [长上下文复核与瓶颈](SYCL-IGPU-Validation_zh.md)。
+这不代表整个混合框架逐位确定，也不是完整 PPL / 下游质量验收。
 
 ## 实现
 
@@ -21,7 +24,7 @@ greedy一致性检查未完全通过，整模型质量验收尚未完成。**
 
 ## 开关与启动
 
-| 开关 | 后端默认 | v6候选profile |
+| 开关 | 底层后端默认 | 交付入口 v6 profile |
 |---|---|---|
 | `KT_SYCL_XMX_PREFILL_LOAD` | `block` | `gather` |
 | `KT_SYCL_XMX_PREFILL_MERGE` | `scalar` | `vector` |
@@ -34,7 +37,7 @@ greedy一致性检查未完全通过，整模型质量验收尚未完成。**
 KT_IGPU_PREFILL_PROFILE=v6 bash kt-kernel/scripts/launch_sycl_igpu_qwen35b.sh
 ```
 
-不设置`KT_IGPU_PREFILL_PROFILE`时仍使用v5；也可明确设置`v5`回退。非法profile会报错。
+不设置`KT_IGPU_PREFILL_PROFILE`时使用v6；设置`KT_IGPU_PREFILL_PROFILE=v5`回退。非法profile会报错。
 脚本会按所选profile覆盖继承的旧开关。自行启动sglang时，设置以下两个值即可
 只回退本阶段，保持v5的gate M8N32/down M16N32及融合decode：
 
@@ -122,4 +125,6 @@ BF16输入、路由与常驻权重上重放v5，与候选输出做FP32逐字节�
 `973c389550412e8bc9eb64948de3691d4ff463f0f21ccee752b966178de0c3b0`。
 
 这些证据支持没有发现iGPU算子精度回归，但不替代整条混合执行链的进一步排查。
-所以保留v5默认入口，v6供明确选择后的性能实验使用，而不标记为整模型质量验收完成。
+**本节为最初的保守 rollout 记录**：当时保留 v5 默认，未标记整模型质量验收完成。
+后续重复控制及 NVIDIA-only / GPU0 对照补齐后，交付入口改为 v6；
+完整混合模型的数值非确定性和质量评估限制仍保留，不把原失败记录改写成“全部通过”。

@@ -5,14 +5,14 @@ set -euo pipefail
 MODEL=${KT_MODEL_PATH:-/home/wy/models/Qwen3.5-35B-A3B-GPTQ-Int4}
 PYTHON=${KT_PYTHON:-/home/wy/miniconda3/envs/kt-kernel/bin/python}
 SETVARS=${ONEAPI_SETVARS:-/opt/intel/oneapi/setvars.sh}
-# Keep the validated v5 default until long-context whole-model consistency is
-# understood. v6 is an explicitly selected performance candidate, not a claim
-# of full-model quality equivalence.
-PREFILL_PROFILE=${KT_IGPU_PREFILL_PROFILE:-v5}
+# v6 is byte-identical to v5 on controlled iGPU inputs and faster end-to-end.
+# Hybrid NVIDIA expert execution is not bitwise repeatable even with v5;
+# see doc/zh/SYCL-IGPU-Validation_zh.md. This is not a full PPL/quality claim.
+PREFILL_PROFILE=${KT_IGPU_PREFILL_PROFILE:-v6}
 case "$PREFILL_PROFILE" in
   v5) PREFILL_LOAD=block; PREFILL_MERGE=scalar; MIN_REVISION=5 ;;
   v6) PREFILL_LOAD=gather; PREFILL_MERGE=vector; MIN_REVISION=6
-      echo "Experimental v6 prefill: operator checks pass; long-context greedy consistency remains under investigation." >&2 ;;
+      echo "v6 vectorized prefill enabled. Hybrid NVIDIA Marlin is not bitwise repeatable; see SYCL-IGPU-Validation_zh.md." >&2 ;;
   *) echo "KT_IGPU_PREFILL_PROFILE must be v5 or v6: $PREFILL_PROFILE" >&2; exit 2 ;;
 esac
 [[ -d "$MODEL" ]] || { echo "Model directory not found: $MODEL" >&2; exit 1; }

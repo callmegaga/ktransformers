@@ -48,3 +48,22 @@ def test_invalid_prefill_profile_is_an_error():
     env = os.environ | {'KT_IGPU_PREFILL_PROFILE': 'invalid'}
     result = subprocess.run(['bash', str(SCRIPT)], env=env, capture_output=True, text=True)
     assert result.returncode == 2 and 'KT_IGPU_PREFILL_PROFILE must be v5 or v6' in result.stderr
+
+
+def test_default_profile_uses_validated_vectorized_prefill(tmp_path):
+    model = tmp_path / 'model'; model.mkdir()
+    setvars = tmp_path / 'setvars.sh'; setvars.write_text('true\n')
+    python = tmp_path / 'python'
+    python.write_text('''#!/bin/bash
+if [[ $1 == -c ]]; then
+  [[ $2 == *">= 6"* ]] || exit 8
+  exit 0
+fi
+printf '%s/%s\n' "$KT_SYCL_XMX_PREFILL_LOAD" "$KT_SYCL_XMX_PREFILL_MERGE"
+''')
+    python.chmod(0o755)
+    env = os.environ | {'KT_MODEL_PATH': str(model), 'KT_PYTHON': str(python),
+                        'ONEAPI_SETVARS': str(setvars)}
+    env.pop('KT_IGPU_PREFILL_PROFILE', None)
+    result = subprocess.run(['bash', str(SCRIPT)], env=env, capture_output=True, text=True, check=True)
+    assert result.stdout.strip() == 'gather/vector'
