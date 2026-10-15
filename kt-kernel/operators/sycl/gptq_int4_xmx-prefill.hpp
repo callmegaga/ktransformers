@@ -4,9 +4,24 @@
 #include "gptq_int4_xmx-kernels.hpp"
 
 namespace sycl_xmx {
+enum class PrefillLoad { Block, Gather };
+
+// Routed rows are not contiguous. Gather dwords across the rows in one vector
+// instead of issuing a separate 32-byte block load for every DPAS input row.
+template <int Rows>
+ESIMD_INLINE es::simd<int8_t, Rows * 32> prefill_gather(
+    const int8_t* input, es::simd<uint32_t, Rows * 8> offsets,
+    es::simd_mask<Rows * 8> mask, uint32_t column) {
+  es::simd<uint32_t, Rows * 8> words = es::gather<uint32_t, Rows * 8>(
+      reinterpret_cast<const uint32_t*>(input),
+      es::simd<uint32_t, Rows * 8>(offsets + column), mask,
+      es::simd<uint32_t, Rows * 8>(0));
+  return words.template bit_cast_view<int8_t>();
+}
+
 // Prefill-only N32 tile: two N16 DPAS blocks share activation loads. No
 // resident weight conversion; precision/group boundaries match the N16 path.
-template <int Rows, bool GateUp, bool FusedQuant = false>
+template <int Rows, bool GateUp, bool FusedQuant = false, PrefillLoad Load = PrefillLoad::Block>
 inline sycl::event prefill_n32(const Tile* tiles, int tile_count, const int* row_tokens,
                               const int8_t* input, const float* input_scales, const Weight& first,
                               const Weight* second, uint16_t* activated, float* down, float limit, float alpha,
@@ -29,19 +44,35 @@ inline sycl::event prefill_n32(const Tile* tiles, int tile_count, const int* row
       es::simd<float, Rows * 16> acc[2], up[2];
 #pragma unroll
       for (int block = 0; block < 2; ++block) { acc[block] = 0; up[block] = 0; }
+      es::simd<uint32_t, Rows * 8> input_offsets = 0;
+      es::simd_mask<Rows * 8> input_mask = 0;
+      if constexpr (Load == PrefillLoad::Gather) {
+#pragma unroll
+        for (int r = 0; r < Rows; ++r) {
+          if (r < tile.rows) {
+            const int row = GateUp ? row_tokens[tile.begin + r] : tile.begin + r;
+            input_offsets.template select<8, 1>(r * 8) = es::simd<uint32_t, 8>(row * k, 4);
+            input_mask.template select<8, 1>(r * 8) = 1;
+          }
+        }
+      }
       for (int g = 0; g < groups; ++g) {
         es::simd<int, Rows * 16> c[2], u[2];
 #pragma unroll
         for (int block = 0; block < 2; ++block) { c[block] = 0; u[block] = 0; }
         for (int j = 0; j < gs; j += 32) {
           es::simd<int8_t, Rows * 32> a = 0;
+          if constexpr (Load == PrefillLoad::Gather) {
+            a = prefill_gather<Rows>(input, input_offsets, input_mask, g * gs + j);
+          } else {
 #pragma unroll
-          for (int r = 0; r < Rows; ++r) {
-            if (r < tile.rows) {
-              const int row = GateUp ? row_tokens[tile.begin + r] : tile.begin + r;
-              es::simd<int8_t, 32> value;
-              value.copy_from(input + static_cast<size_t>(row) * k + g * gs + j);
-              a.template select<32, 1>(r * 32) = value;
+            for (int r = 0; r < Rows; ++r) {
+              if (r < tile.rows) {
+                const int row = GateUp ? row_tokens[tile.begin + r] : tile.begin + r;
+                es::simd<int8_t, 32> value;
+                value.copy_from(input + static_cast<size_t>(row) * k + g * gs + j);
+                a.template select<32, 1>(r * 32) = value;
+              }
             }
           }
 #pragma unroll

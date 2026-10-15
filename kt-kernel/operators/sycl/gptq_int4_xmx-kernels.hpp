@@ -324,6 +324,31 @@ inline sycl::event projection(const Tile* tiles, int tile_count, const int* row_
   });
 }
 
+// Preserve the original slot summation order and FP32 precision. A work-item
+// handles a contiguous output vector, amortizing route lookup and loads.
+template <int Width>
+inline sycl::event merge_vector(const int* slot_rows, const float* weights, const float* down,
+                                float* output, int rows, int topk, int hidden, const sycl::event& dep) {
+  return sycl_int4::queue().submit([&](sycl::handler& h) {
+    h.depends_on(dep);
+    h.parallel_for(sycl::range<1>(static_cast<size_t>(rows) * (hidden / Width)),
+                   [=](sycl::id<1> id) SYCL_ESIMD_KERNEL {
+      const int token = id[0] / (hidden / Width);
+      const int col = (id[0] % (hidden / Width)) * Width;
+      es::simd<float, Width> sum = 0;
+      for (int slot = 0; slot < topk; ++slot) {
+        const int row = slot_rows[token * topk + slot];
+        if (row >= 0) {
+          es::simd<float, Width> values;
+          values.copy_from(down + static_cast<size_t>(row) * hidden + col);
+          sum += values * weights[token * topk + slot];
+        }
+      }
+      sum.copy_to(output + static_cast<size_t>(token) * hidden + col);
+    });
+  });
+}
+
 inline sycl::event merge(const int* slot_rows, const float* weights, const float* down, float* output, int rows,
                          int topk, int hidden, const sycl::event& dep) {
   return sycl_int4::queue().submit([&](sycl::handler& h) {

@@ -21,6 +21,12 @@ from bench_sycl_xmx_moe import packed_weights
 
 VARIANTS = {
     'baseline': {},
+    'prefill-gather-merge': {'KT_SYCL_XMX_PREFILL_N': '32', 'KT_SYCL_XMX_PREFILL_DOWN_ROWS': '16', 'KT_SYCL_XMX_PREFILL_LOAD': 'gather', 'KT_SYCL_XMX_PREFILL_MERGE': 'vector'},
+    'prefill-vector-merge': {'KT_SYCL_XMX_PREFILL_N': '32', 'KT_SYCL_XMX_PREFILL_DOWN_ROWS': '16', 'KT_SYCL_XMX_PREFILL_MERGE': 'vector'},
+    'prefill-gather': {'KT_SYCL_XMX_PREFILL_N': '32', 'KT_SYCL_XMX_PREFILL_DOWN_ROWS': '16', 'KT_SYCL_XMX_PREFILL_LOAD': 'gather'},
+    'prefill-g4-gather': {'KT_SYCL_XMX_PREFILL_N': '32', 'KT_SYCL_XMX_PREFILL_ROWS': '4', 'KT_SYCL_XMX_PREFILL_DOWN_ROWS': '16', 'KT_SYCL_XMX_PREFILL_LOAD': 'gather'},
+    'prefill-g16-gather': {'KT_SYCL_XMX_PREFILL_N': '32', 'KT_SYCL_XMX_PREFILL_ROWS': '16', 'KT_SYCL_XMX_PREFILL_DOWN_ROWS': '16', 'KT_SYCL_XMX_PREFILL_LOAD': 'gather'},
+    'prefill-d8-gather': {'KT_SYCL_XMX_PREFILL_N': '32', 'KT_SYCL_XMX_PREFILL_DOWN_ROWS': '8', 'KT_SYCL_XMX_PREFILL_LOAD': 'gather'},
     'prefill-m16': {'KT_SYCL_XMX_PREFILL_ROWS': '16'},
     'prefill-g8d16n32': {'KT_SYCL_XMX_PREFILL_N': '32', 'KT_SYCL_XMX_PREFILL_DOWN_ROWS': '16'},
     'prefill-n32': {'KT_SYCL_XMX_PREFILL_N': '32'},
@@ -81,7 +87,7 @@ def main():
     mask = torch.zeros(args.experts, dtype=torch.bool)
     mapping = torch.arange(args.experts, dtype=torch.int64)
     executors, configs, settings = {}, {}, {}
-    defaults = {'KT_SYCL_XMX_MODE': 'int8', 'KT_SYCL_XMX_GATE_KERNEL': 'xmx',
+    defaults = {'KT_SYCL_XMX_PREFILL_MERGE': 'scalar', 'KT_SYCL_XMX_PREFILL_LOAD': 'block', 'KT_SYCL_XMX_MODE': 'int8', 'KT_SYCL_XMX_GATE_KERNEL': 'xmx',
                 'KT_SYCL_XMX_DOWN_KERNEL': 'xmx', 'KT_SYCL_XMX_DECODE_GATE_KERNEL': 'inherit',
                 'KT_SYCL_XMX_DECODE_DOWN_KERNEL': 'inherit', 'KT_SYCL_XMX_GATE_SPLITS': '2',
                 'KT_SYCL_XMX_DOWN_SPLITS': '1', 'KT_SYCL_XMX_FUSED_QUANT': 'prefill',

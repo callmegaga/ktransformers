@@ -468,12 +468,13 @@ def test_fused_expert_rejects_incompatible_options(setup, monkeypatch, setting, 
 
 def test_xmx_implementation_revision_is_reported(setup):
     ext, _, _, _, *_ = setup
-    assert ext.moe.SYCLXMXGPTQInt4_MOE.implementation_revision() >= 4
+    assert ext.moe.SYCLXMXGPTQInt4_MOE.implementation_revision() >= 6
 
 
-@pytest.mark.parametrize('prefill_rows,columns,down_rows', [('16', '16', '16'), ('32', '16', '32'), ('8', '32', '8'), ('16', '32', '16'), ('8', '32', '16')])
+@pytest.mark.parametrize('prefill_rows,columns,down_rows,load', [('16', '16', '16', 'block'), ('32', '16', '32', 'block'), ('8', '32', '8', 'block'), ('16', '32', '16', 'block'), ('8', '32', '16', 'block'), ('8', '32', '16', 'gather'), ('16', '32', '16', 'gather')])
 @pytest.mark.parametrize('fused', ['0', 'prefill'])
-def test_wide_prefill_matches_original_with_tails(setup, monkeypatch, prefill_rows, columns, down_rows, fused):
+@pytest.mark.parametrize('merge', ['scalar', 'vector'])
+def test_wide_prefill_matches_original_with_tails(setup, monkeypatch, prefill_rows, columns, down_rows, load, fused, merge):
     ext, torch, cpu, config, mask, qw, scales = setup
     generator = torch.Generator().manual_seed(150)
     qw.copy_(torch.randint(-(1 << 31), (1 << 31) - 1, qw.shape, dtype=torch.int32, generator=generator))
@@ -485,7 +486,11 @@ def test_wide_prefill_matches_original_with_tails(setup, monkeypatch, prefill_ro
     monkeypatch.setenv('KT_SYCL_XMX_PREFILL_ROWS', '8')
     monkeypatch.setenv('KT_SYCL_XMX_PREFILL_N', '16')
     monkeypatch.setenv('KT_SYCL_XMX_PREFILL_DOWN_ROWS', '8')
+    monkeypatch.setenv('KT_SYCL_XMX_PREFILL_LOAD', 'block')
+    monkeypatch.setenv('KT_SYCL_XMX_PREFILL_MERGE', 'scalar')
     original = ext.moe.SYCLXMXGPTQInt4_MOE(config)
+    monkeypatch.setenv('KT_SYCL_XMX_PREFILL_LOAD', load)
+    monkeypatch.setenv('KT_SYCL_XMX_PREFILL_MERGE', merge)
     monkeypatch.setenv('KT_SYCL_XMX_PREFILL_ROWS', prefill_rows)
     monkeypatch.setenv('KT_SYCL_XMX_PREFILL_N', columns)
     monkeypatch.setenv('KT_SYCL_XMX_PREFILL_DOWN_ROWS', down_rows)
@@ -508,7 +513,7 @@ def test_wide_prefill_matches_original_with_tails(setup, monkeypatch, prefill_ro
 
 
 @pytest.mark.parametrize('name,value', [('KT_SYCL_XMX_PREFILL_ROWS', '12'), ('KT_SYCL_XMX_PREFILL_N', '64'),
-                                      ('KT_SYCL_XMX_PREFILL_DOWN_ROWS', '0')])
+                                      ('KT_SYCL_XMX_PREFILL_DOWN_ROWS', '0'), ('KT_SYCL_XMX_PREFILL_MERGE', 'invalid')])
 def test_invalid_prefill_tiling_is_rejected(setup, monkeypatch, name, value):
     ext, _, _, config, *_ = setup
     monkeypatch.setenv(name, value)
@@ -524,4 +529,13 @@ def test_n32_rejects_incompatible_prefill_projections(setup, monkeypatch, mode, 
     monkeypatch.setenv('KT_SYCL_XMX_DOWN_KERNEL', down)
     monkeypatch.setenv('KT_SYCL_XMX_PREFILL_N', '32')
     with pytest.raises(RuntimeError, match='PREFILL_N'):
+        ext.moe.SYCLXMXGPTQInt4_MOE(config)
+
+
+@pytest.mark.parametrize('load,columns', [('invalid', '32'), ('gather', '16'), ('packed', '32')])
+def test_prefill_load_rejects_invalid_or_unusable_modes(setup, monkeypatch, load, columns):
+    ext, _, _, config, *_ = setup
+    monkeypatch.setenv('KT_SYCL_XMX_PREFILL_LOAD', load)
+    monkeypatch.setenv('KT_SYCL_XMX_PREFILL_N', columns)
+    with pytest.raises(RuntimeError, match='PREFILL_LOAD'):
         ext.moe.SYCLXMXGPTQInt4_MOE(config)

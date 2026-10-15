@@ -6,7 +6,7 @@
 #include "../../operators/sycl/gptq_int4_xmx-prefill.hpp"
 using namespace sycl_xmx;
 
-template <int Rows, bool Gate, bool Fused = false>
+template <int Rows, bool Gate, bool Fused = false, PrefillLoad Load = PrefillLoad::Block>
 void check(int gs) {
   constexpr int K = 256, N = 256, R = 33, E = 2;
   const int groups = K / gs;
@@ -46,7 +46,7 @@ void check(int gs) {
   auto first = projection<8, true, Gate, Fused>(old_tiles.data, a, tokens.data, nullptr, input.data, sa.data,
       w, &u, aref.data, oref.data, .5f, 1.702f, nullptr, qref.data, sref.data);
   sycl_int4::wait_and_throw(first);
-  auto second = prefill_n32<Rows, Gate, Fused>(new_tiles.data, b, tokens.data, input.data, sa.data,
+  auto second = prefill_n32<Rows, Gate, Fused, Load>(new_tiles.data, b, tokens.data, input.data, sa.data,
       w, &u, atest.data, otest.data, .5f, 1.702f, nullptr, qtest.data, stest.data);
   sycl_int4::wait_and_throw(second);
   for (int j = 0; j < R * E * N; ++j) {
@@ -72,7 +72,12 @@ template <int Rows>
 void suite() {
   for (int group : {32, 128}) { check<Rows, true>(group); check<Rows, false>(group); }
   check<Rows, true, true>(128);
-  std::cout << "N32 M=" << Rows << " gate/down, distinct experts/groups/scales, reverse row mapping, tail33, fused quant exact passed\n";
+  for (int group : {32, 128}) {
+    check<Rows, true, false, PrefillLoad::Gather>(group);
+    check<Rows, false, false, PrefillLoad::Gather>(group);
+  }
+  check<Rows, true, true, PrefillLoad::Gather>(128);
+  std::cout << "N32 M=" << Rows << " gate/down, distinct experts/groups/scales, reverse row mapping, tail33, block/gather, fused quant exact passed\n";
 }
 int main() {
   try { suite<1>(); suite<2>(); suite<4>(); suite<8>(); suite<16>(); }

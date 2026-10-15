@@ -88,6 +88,18 @@ class SYCL_XMX_GPTQ_INT4_MOE_TP {
     if (prefill_n_ == 32 && (!q8_ || gate_kernel_ != Kernel::XMX || down_kernel_ != Kernel::XMX ||
                              c.hidden_size % 32 || c.intermediate_size % 32 || prefill_rows_ > 16 || prefill_down_rows_ > 16))
       throw std::runtime_error("KT_SYCL_XMX_PREFILL_N=32 requires INT8 XMX prefill, N%32=0 and rows<=16");
+    const char* load = std::getenv("KT_SYCL_XMX_PREFILL_LOAD");
+    const std::string load_mode = load ? load : "block";
+    if (load_mode != "block" && load_mode != "gather")
+      throw std::runtime_error("KT_SYCL_XMX_PREFILL_LOAD must be block or gather");
+    if (load_mode != "block" && prefill_n_ != 32)
+      throw std::runtime_error("KT_SYCL_XMX_PREFILL_LOAD=gather requires PREFILL_N=32");
+    prefill_load_ = load_mode == "gather" ? sycl_xmx::PrefillLoad::Gather : sycl_xmx::PrefillLoad::Block;
+    const char* merge_prefill = std::getenv("KT_SYCL_XMX_PREFILL_MERGE");
+    const std::string prefill_merge = merge_prefill ? merge_prefill : "scalar";
+    if (prefill_merge != "scalar" && prefill_merge != "vector")
+      throw std::runtime_error("KT_SYCL_XMX_PREFILL_MERGE must be scalar or vector");
+    vector_prefill_merge_ = prefill_merge == "vector";
     const char* graph = std::getenv("KT_SYCL_XMX_GRAPH");
     if (graph && std::string(graph) != "0" && std::string(graph) != "1")
       throw std::runtime_error("KT_SYCL_XMX_GRAPH must be 0 or 1");
@@ -141,6 +153,7 @@ class SYCL_XMX_GPTQ_INT4_MOE_TP {
     printf("Created SYCL_XMX_GPTQ_INT4_MOE mode=%s layer=%d\n", value.c_str(), c.layer_idx);
     printf("SYCL decode fused_expert=%d merge=%s\n", fused_expert_, merge_mode.c_str());
     printf("SYCL prefill tile gate=M%dN%d down=M%dN%d\n", prefill_rows_, prefill_n_, prefill_down_rows_, prefill_n_);
+    printf("SYCL prefill load=%s merge=%s\n", load_mode.c_str(), prefill_merge.c_str());
     printf("SYCL projection kernels prefill=%s/%s decode=%s/%s splits=%d/%d\n", kernel_name(gate_kernel_),
            kernel_name(down_kernel_), kernel_name(decode_gate_), kernel_name(decode_down_), gate_splits_, down_splits_);
   }
@@ -337,6 +350,8 @@ class SYCL_XMX_GPTQ_INT4_MOE_TP {
   Kernel decode_gate_ = Kernel::XMX, decode_down_ = Kernel::XMX;
   int vector_splits_ = 4, gate_splits_ = 4, down_splits_ = 4;
   int prefill_rows_ = 8, prefill_down_rows_ = 8, prefill_n_ = 16, down_tile_count_ = 0;
+  sycl_xmx::PrefillLoad prefill_load_ = sycl_xmx::PrefillLoad::Block;
+  bool vector_prefill_merge_ = false;
   bool use_graph_ = false;
   bool fused_merge_ = false;
   bool fused_expert_ = false;
@@ -370,13 +385,18 @@ class SYCL_XMX_GPTQ_INT4_MOE_TP {
     const int splits = GateUp ? gate_splits_ : down_splits_;
     if constexpr (Rows <= 16) {
       if (prefill && prefill_n_ == 32) {
-        if constexpr (GateUp) {
-          if (fused)
-            return sycl_xmx::prefill_n32<Rows, true, true>(tiles, nt, tokens, quantized, scales, first, second,
-                nullptr, nullptr, config.swiglu_limit, config.swiglu_alpha, dep, qm_.data, sm_.data);
-        }
-        return sycl_xmx::prefill_n32<Rows, GateUp>(tiles, nt, tokens, quantized, scales, first, second,
-            activated, down, config.swiglu_limit, config.swiglu_alpha, dep);
+        auto n32 = [&]<sycl_xmx::PrefillLoad Load>() {
+          if constexpr (GateUp) {
+            if (fused)
+              return sycl_xmx::prefill_n32<Rows, true, true, Load>(tiles, nt, tokens, quantized, scales, first, second,
+                  nullptr, nullptr, config.swiglu_limit, config.swiglu_alpha, dep, qm_.data, sm_.data);
+          }
+          return sycl_xmx::prefill_n32<Rows, GateUp, false, Load>(tiles, nt, tokens, quantized, scales, first, second,
+              activated, down, config.swiglu_limit, config.swiglu_alpha, dep);
+        };
+        if (prefill_load_ != sycl_xmx::PrefillLoad::Block)
+          return n32.template operator()<sycl_xmx::PrefillLoad::Gather>();
+        return n32.template operator()<sycl_xmx::PrefillLoad::Block>();
       }
     }
     if constexpr (Rows > 8) {
@@ -495,7 +515,13 @@ class SYCL_XMX_GPTQ_INT4_MOE_TP {
     auto d = rows > 1 ? submit_prefill_down(down, &middle)
                       : submit_projection<Rows, false>(down, &middle, nt);
     remember(sycl_xmx::PipelineProfile::Down, d);
-    auto result = sycl_xmx::merge(slot_rows_.data, routing_.data, down_.data, output_.data, rows, topk, config.hidden_size, d);
+    sycl::event result;
+    if (rows > 1 && vector_prefill_merge_ && config.hidden_size % 256 == 0)
+      result = sycl_xmx::merge_vector<256>(slot_rows_.data, routing_.data, down_.data, output_.data, rows, topk, config.hidden_size, d);
+    else if (rows > 1 && vector_prefill_merge_ && config.hidden_size % 128 == 0)
+      result = sycl_xmx::merge_vector<128>(slot_rows_.data, routing_.data, down_.data, output_.data, rows, topk, config.hidden_size, d);
+    else
+      result = sycl_xmx::merge(slot_rows_.data, routing_.data, down_.data, output_.data, rows, topk, config.hidden_size, d);
     remember(sycl_xmx::PipelineProfile::Merge, result);
     return result;
   }
@@ -552,7 +578,7 @@ class TP_MOE<SYCL_XMX_GPTQ_INT4_MOE_TP> : public TP_MOE_Common<SYCL_XMX_GPTQ_INT
       throw std::runtime_error("KT_SYCL_XMX_NUMA_DISPATCH must be 0 or 1");
     use_numa_dispatch_ = numa && std::string(numa) == "1";
   }
-  static int implementation_revision() { return 5; }
+  static int implementation_revision() { return 6; }
   void load_weights() override {
     this->weights_loaded = false;
     this->tps[0]->load_weights(this->config);
