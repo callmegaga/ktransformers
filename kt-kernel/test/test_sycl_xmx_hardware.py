@@ -474,7 +474,8 @@ def test_xmx_implementation_revision_is_reported(setup):
 @pytest.mark.parametrize('prefill_rows,columns,down_rows,load', [('16', '16', '16', 'block'), ('32', '16', '32', 'block'), ('8', '32', '8', 'block'), ('16', '32', '16', 'block'), ('8', '32', '16', 'block'), ('8', '32', '16', 'gather'), ('16', '32', '16', 'gather')])
 @pytest.mark.parametrize('fused', ['0', 'prefill'])
 @pytest.mark.parametrize('merge', ['scalar', 'vector'])
-def test_wide_prefill_matches_original_with_tails(setup, monkeypatch, prefill_rows, columns, down_rows, load, fused, merge):
+@pytest.mark.parametrize('incremental', [False, True])
+def test_wide_prefill_matches_original_with_tails(setup, monkeypatch, prefill_rows, columns, down_rows, load, fused, merge, incremental):
     ext, torch, cpu, config, mask, qw, scales = setup
     generator = torch.Generator().manual_seed(150)
     qw.copy_(torch.randint(-(1 << 31), (1 << 31) - 1, qw.shape, dtype=torch.int32, generator=generator))
@@ -502,10 +503,11 @@ def test_wide_prefill_matches_original_with_tails(setup, monkeypatch, prefill_ro
         ids = torch.tensor([[1, 1] if r % 3 == 0 else [r % 4, -1] for r in range(rows)], dtype=torch.int64)
         weights = torch.softmax(torch.randn(rows, 2, generator=generator), 1)
         qlen = torch.tensor([rows], dtype=torch.int32)
+        initial = torch.randn(rows, 128, generator=generator).bfloat16()
         values = []
         for moe in (original, wide):
-            out = torch.empty_like(x)
-            cpu.submit(moe.forward_task(qlen.data_ptr(), 2, ids.data_ptr(), weights.data_ptr(), x.data_ptr(), out.data_ptr(), False)); cpu.sync()
+            out = initial.clone()
+            cpu.submit(moe.forward_task(qlen.data_ptr(), 2, ids.data_ptr(), weights.data_ptr(), x.data_ptr(), out.data_ptr(), incremental)); cpu.sync()
             values.append(out)
         assert torch.isfinite(values[1]).all()
         torch.testing.assert_close(values[0], values[1], rtol=0, atol=0)

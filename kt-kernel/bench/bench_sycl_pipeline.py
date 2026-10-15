@@ -56,6 +56,7 @@ def quantiles(samples):
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--variants', default='baseline,split,host-quant,fused-quant')
+    p.add_argument('--exact', action='store_true', help='Require bitwise final BF16 equality across variants')
     p.add_argument('--trace', choices=['0', 'host', 'device'], default='device')
     p.add_argument('--transport', choices=['cpu', 'cuda'], default='cpu')
     p.add_argument('--rows', default='1,17,64')
@@ -169,6 +170,7 @@ def main():
                 # Same routes are compared within each iteration; reset every iteration.
                 if name == order[0]: reference = out.clone()
                 else:
+                    if args.exact: torch.testing.assert_close(out.view(torch.int16), reference.view(torch.int16), rtol=0, atol=0)
                     relative_rmse = ((out.float() - reference.float()).square().mean().sqrt() /
                                      reference.float().square().mean().sqrt().clamp_min(1e-12))
                     if relative_rmse > .03:

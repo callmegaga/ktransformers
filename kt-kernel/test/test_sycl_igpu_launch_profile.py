@@ -2,11 +2,13 @@
 from pathlib import Path
 import os
 import subprocess
+import pytest
 
 SCRIPT = Path(__file__).parents[1] / 'scripts/launch_sycl_igpu_qwen35b.sh'
 
 
-def test_launch_profile_overrides_stale_settings_and_preserves_paths(tmp_path):
+@pytest.mark.parametrize('preset,expected', [('v5', 'block/scalar'), ('v6', 'gather/vector')])
+def test_launch_profile_overrides_stale_settings_and_preserves_paths(tmp_path, preset, expected):
     model = tmp_path / 'model with spaces'; model.mkdir()
     setvars = tmp_path / 'setvars with spaces.sh'; setvars.write_text('export TEST_ONEAPI_LOADED=1\n')
     python = tmp_path / 'fake python'
@@ -17,11 +19,11 @@ printf '<%s>\\n' "$@"
 ''')
     python.chmod(0o755)
     env = os.environ | {'KT_MODEL_PATH': str(model), 'KT_PYTHON': str(python), 'ONEAPI_SETVARS': str(setvars),
-                        'KT_SYCL_XMX_FUSED_EXPERT': '0', 'KT_SYCL_XMX_DECODE_MERGE': 'fused',
+                        'KT_IGPU_PREFILL_PROFILE': preset, 'KT_SYCL_XMX_FUSED_EXPERT': '0', 'KT_SYCL_XMX_DECODE_MERGE': 'fused',
                         'KT_SYCL_XMX_GRAPH': '1', 'KT_SYCL_XMX_TRACE': 'device',
                         'KT_SYCL_XMX_PREFILL_ROWS': '32', 'KT_SYCL_XMX_PREFILL_DOWN_ROWS': '8', 'KT_SYCL_XMX_PREFILL_N': '16', 'KT_SYCL_XMX_PREFILL_LOAD': 'block', 'KT_SYCL_XMX_PREFILL_MERGE': 'scalar'}
     result = subprocess.run(['bash', str(SCRIPT), '--log-level', 'warning'], env=env, capture_output=True, text=True, check=True)
-    assert result.stdout.splitlines()[0] == '1/separate/2/0/0/1/8/16/32/gather/vector'
+    assert result.stdout.splitlines()[0] == '1/separate/2/0/0/1/8/16/32/' + expected
     assert f'<{model}>' in result.stdout
     assert '<--log-level>\n<warning>' in result.stdout
 
@@ -40,3 +42,9 @@ def test_old_extension_preflight_is_not_ignored(tmp_path):
     env = os.environ | {'KT_MODEL_PATH': str(model), 'KT_PYTHON': str(python), 'ONEAPI_SETVARS': str(setvars)}
     result = subprocess.run(['bash', str(SCRIPT)], env=env, capture_output=True, text=True)
     assert result.returncode == 7
+
+
+def test_invalid_prefill_profile_is_an_error():
+    env = os.environ | {'KT_IGPU_PREFILL_PROFILE': 'invalid'}
+    result = subprocess.run(['bash', str(SCRIPT)], env=env, capture_output=True, text=True)
+    assert result.returncode == 2 and 'KT_IGPU_PREFILL_PROFILE must be v5 or v6' in result.stderr
