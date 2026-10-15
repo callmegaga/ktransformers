@@ -21,6 +21,11 @@ from bench_sycl_xmx_moe import packed_weights
 
 VARIANTS = {
     'baseline': {},
+    'prefill-m16': {'KT_SYCL_XMX_PREFILL_ROWS': '16'},
+    'prefill-g8d16n32': {'KT_SYCL_XMX_PREFILL_N': '32', 'KT_SYCL_XMX_PREFILL_DOWN_ROWS': '16'},
+    'prefill-n32': {'KT_SYCL_XMX_PREFILL_N': '32'},
+    'prefill-m16n32': {'KT_SYCL_XMX_PREFILL_N': '32', 'KT_SYCL_XMX_PREFILL_ROWS': '16'},
+    'prefill-m32': {'KT_SYCL_XMX_PREFILL_ROWS': '32'},
     'split': {'KT_SYCL_XMX_DECODE_GATE_KERNEL': 'xmx-split', 'KT_SYCL_XMX_GATE_SPLITS': '2'},
     'fused-merge': {'KT_SYCL_XMX_DECODE_MERGE': 'fused'},
     'split-fused-merge': {'KT_SYCL_XMX_DECODE_MERGE': 'fused', 'KT_SYCL_XMX_DECODE_GATE_KERNEL': 'xmx-split'},
@@ -81,9 +86,11 @@ def main():
                 'KT_SYCL_XMX_DECODE_DOWN_KERNEL': 'inherit', 'KT_SYCL_XMX_GATE_SPLITS': '2',
                 'KT_SYCL_XMX_DOWN_SPLITS': '1', 'KT_SYCL_XMX_FUSED_QUANT': 'prefill',
                 'KT_SYCL_XMX_GRAPH': '0', 'KT_SYCL_XMX_HOST_QUANT': '0',
-                'KT_SYCL_XMX_NUMA_DISPATCH': '1', 'KT_SYCL_XMX_DECODE_MERGE': 'separate', 'KT_SYCL_XMX_FUSED_EXPERT': '0'}
+                'KT_SYCL_XMX_NUMA_DISPATCH': '1', 'KT_SYCL_XMX_DECODE_MERGE': 'separate', 'KT_SYCL_XMX_FUSED_EXPERT': '0', 'KT_SYCL_XMX_PREFILL_ROWS': '8', 'KT_SYCL_XMX_PREFILL_N': '16', 'KT_SYCL_XMX_PREFILL_DOWN_ROWS': '8'}
     for name in names:
         settings[name] = defaults | VARIANTS[name]
+        if 'KT_SYCL_XMX_PREFILL_DOWN_ROWS' not in VARIANTS[name]:
+            settings[name]['KT_SYCL_XMX_PREFILL_DOWN_ROWS'] = settings[name]['KT_SYCL_XMX_PREFILL_ROWS']
         os.environ.update(settings[name])
         config = ext.moe.MOEConfig(args.experts, args.active, 2048, 512, mask.data_ptr())
         config.pool = cpu.backend_

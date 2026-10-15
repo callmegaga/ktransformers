@@ -469,3 +469,59 @@ def test_fused_expert_rejects_incompatible_options(setup, monkeypatch, setting, 
 def test_xmx_implementation_revision_is_reported(setup):
     ext, _, _, _, *_ = setup
     assert ext.moe.SYCLXMXGPTQInt4_MOE.implementation_revision() >= 4
+
+
+@pytest.mark.parametrize('prefill_rows,columns,down_rows', [('16', '16', '16'), ('32', '16', '32'), ('8', '32', '8'), ('16', '32', '16'), ('8', '32', '16')])
+@pytest.mark.parametrize('fused', ['0', 'prefill'])
+def test_wide_prefill_matches_original_with_tails(setup, monkeypatch, prefill_rows, columns, down_rows, fused):
+    ext, torch, cpu, config, mask, qw, scales = setup
+    generator = torch.Generator().manual_seed(150)
+    qw.copy_(torch.randint(-(1 << 31), (1 << 31) - 1, qw.shape, dtype=torch.int32, generator=generator))
+    scales.fill_(.003)
+    config.max_len = 65
+    monkeypatch.setenv('KT_SYCL_XMX_FUSED_QUANT', fused)
+    monkeypatch.setenv('KT_SYCL_XMX_GATE_KERNEL', 'xmx')
+    monkeypatch.setenv('KT_SYCL_XMX_DOWN_KERNEL', 'xmx')
+    monkeypatch.setenv('KT_SYCL_XMX_PREFILL_ROWS', '8')
+    monkeypatch.setenv('KT_SYCL_XMX_PREFILL_N', '16')
+    monkeypatch.setenv('KT_SYCL_XMX_PREFILL_DOWN_ROWS', '8')
+    original = ext.moe.SYCLXMXGPTQInt4_MOE(config)
+    monkeypatch.setenv('KT_SYCL_XMX_PREFILL_ROWS', prefill_rows)
+    monkeypatch.setenv('KT_SYCL_XMX_PREFILL_N', columns)
+    monkeypatch.setenv('KT_SYCL_XMX_PREFILL_DOWN_ROWS', down_rows)
+    wide = ext.moe.SYCLXMXGPTQInt4_MOE(config)
+    for moe in (original, wide):
+        cpu.submit(moe.load_weights_task()); cpu.sync()
+    for rows in (1, 17, 33, 65):
+        x = torch.randn(rows, 128, generator=generator).bfloat16()
+        ids = torch.tensor([[1, 1] if r % 3 == 0 else [r % 4, -1] for r in range(rows)], dtype=torch.int64)
+        weights = torch.softmax(torch.randn(rows, 2, generator=generator), 1)
+        qlen = torch.tensor([rows], dtype=torch.int32)
+        values = []
+        for moe in (original, wide):
+            out = torch.empty_like(x)
+            cpu.submit(moe.forward_task(qlen.data_ptr(), 2, ids.data_ptr(), weights.data_ptr(), x.data_ptr(), out.data_ptr(), False)); cpu.sync()
+            values.append(out)
+        assert torch.isfinite(values[1]).all()
+        torch.testing.assert_close(values[0], values[1], rtol=0, atol=0)
+
+
+
+@pytest.mark.parametrize('name,value', [('KT_SYCL_XMX_PREFILL_ROWS', '12'), ('KT_SYCL_XMX_PREFILL_N', '64'),
+                                      ('KT_SYCL_XMX_PREFILL_DOWN_ROWS', '0')])
+def test_invalid_prefill_tiling_is_rejected(setup, monkeypatch, name, value):
+    ext, _, _, config, *_ = setup
+    monkeypatch.setenv(name, value)
+    with pytest.raises(RuntimeError, match=name):
+        ext.moe.SYCLXMXGPTQInt4_MOE(config)
+
+
+@pytest.mark.parametrize('mode,gate,down', [('fp16', 'xmx', 'xmx'), ('int8', 'vector', 'xmx'), ('int8', 'xmx', 'dp4a')])
+def test_n32_rejects_incompatible_prefill_projections(setup, monkeypatch, mode, gate, down):
+    ext, _, _, config, *_ = setup
+    monkeypatch.setenv('KT_SYCL_XMX_MODE', mode)
+    monkeypatch.setenv('KT_SYCL_XMX_GATE_KERNEL', gate)
+    monkeypatch.setenv('KT_SYCL_XMX_DOWN_KERNEL', down)
+    monkeypatch.setenv('KT_SYCL_XMX_PREFILL_N', '32')
+    with pytest.raises(RuntimeError, match='PREFILL_N'):
+        ext.moe.SYCLXMXGPTQInt4_MOE(config)

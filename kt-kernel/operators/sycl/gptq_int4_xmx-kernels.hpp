@@ -157,13 +157,24 @@ inline sycl::event projection(const Tile* tiles, int tile_count, const int* row_
           es::simd<uint32_t, 64> b;
           b.copy_from(w0 + wi + (g * gs + j) / 8 * 16);
           b ^= 0x88888888u;
-          c0 = xmx::dpas<8, Rows, int, int, uint32_t, int8_t, xmx::dpas_argument_type::s4, xmx::dpas_argument_type::s8>(
-              c0, b, a);
+          constexpr int D = Rows > 8 ? 8 : Rows;
+#pragma unroll
+          for (int row_base = 0; row_base < Rows; row_base += D) {
+            es::simd<int, D * 16> partial = c0.template select<D * 16, 1>(row_base * 16);
+            es::simd<int8_t, D * 32> src = a.template select<D * 32, 1>(row_base * 32);
+            c0.template select<D * 16, 1>(row_base * 16) = xmx::dpas<8, D, int, int, uint32_t, int8_t,
+                xmx::dpas_argument_type::s4, xmx::dpas_argument_type::s8>(partial, b, src);
+          }
           if constexpr (GateUp) {
             b.copy_from(w1 + wi + (g * gs + j) / 8 * 16);
             b ^= 0x88888888u;
-            c1 = xmx::dpas<8, Rows, int, int, uint32_t, int8_t, xmx::dpas_argument_type::s4,
-                           xmx::dpas_argument_type::s8>(c1, b, a);
+#pragma unroll
+            for (int row_base = 0; row_base < Rows; row_base += D) {
+              es::simd<int, D * 16> partial = c1.template select<D * 16, 1>(row_base * 16);
+              es::simd<int8_t, D * 32> src = a.template select<D * 32, 1>(row_base * 32);
+              c1.template select<D * 16, 1>(row_base * 16) = xmx::dpas<8, D, int, int, uint32_t, int8_t,
+                  xmx::dpas_argument_type::s4, xmx::dpas_argument_type::s8>(partial, b, src);
+            }
           }
         }
 #pragma unroll
@@ -190,10 +201,21 @@ inline sycl::event projection(const Tile* tiles, int tile_count, const int* row_
             }
           }
           auto b = dequant_f16(w0 + wi + (g * gs + j) / 8 * 16, sc0);
-          acc0 = xmx::dpas<8, Rows, float>(acc0, b, a);
+          constexpr int D = Rows > 8 ? 8 : Rows;
+#pragma unroll
+          for (int row_base = 0; row_base < Rows; row_base += D) {
+            es::simd<float, D * 16> partial = acc0.template select<D * 16, 1>(row_base * 16);
+            es::simd<sycl::half, D * 16> src = a.template select<D * 16, 1>(row_base * 16);
+            acc0.template select<D * 16, 1>(row_base * 16) = xmx::dpas<8, D, float>(partial, b, src);
+          }
           if constexpr (GateUp) {
             b = dequant_f16(w1 + wi + (g * gs + j) / 8 * 16, sc1);
-            acc1 = xmx::dpas<8, Rows, float>(acc1, b, a);
+#pragma unroll
+            for (int row_base = 0; row_base < Rows; row_base += D) {
+              es::simd<float, D * 16> partial = acc1.template select<D * 16, 1>(row_base * 16);
+              es::simd<sycl::half, D * 16> src = a.template select<D * 16, 1>(row_base * 16);
+              acc1.template select<D * 16, 1>(row_base * 16) = xmx::dpas<8, D, float>(partial, b, src);
+            }
           }
         }
       }

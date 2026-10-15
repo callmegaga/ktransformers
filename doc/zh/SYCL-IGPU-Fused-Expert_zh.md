@@ -1,5 +1,7 @@
 # Panther Lake iGPU 整专家融合与本机性能配置
 
+后续 prefill 优化及更新的交付配置见 [prefill 说明](SYCL-IGPU-Prefill_zh.md)；下述性能记录为第四阶段历史数据。
+
 适用对象为当前 Core Ultra7 356H / `intel_gpu_ptl_u` 平台与
 Qwen3.5-35B-A3B-GPTQ-Int4，H=2048、专家 I=512、group=128。
 这里的性能最优指**本机完成测量的候选中较优配置**，不是所有实现/框架的全局最优证明。

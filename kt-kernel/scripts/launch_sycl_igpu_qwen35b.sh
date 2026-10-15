@@ -16,6 +16,7 @@ export KT_SYCL_INT4_BACKEND=xmx KT_SYCL_XMX_MODE=int8 KT_SYCL_XMX_ROWS=8
 export KT_SYCL_XMX_GATE_KERNEL=xmx KT_SYCL_XMX_DOWN_KERNEL=xmx
 export KT_SYCL_XMX_DECODE_GATE_KERNEL=xmx-split KT_SYCL_XMX_DECODE_DOWN_KERNEL=xmx
 export KT_SYCL_XMX_GATE_SPLITS=2 KT_SYCL_XMX_DOWN_SPLITS=1
+export KT_SYCL_XMX_PREFILL_ROWS=8 KT_SYCL_XMX_PREFILL_DOWN_ROWS=16 KT_SYCL_XMX_PREFILL_N=32
 export KT_SYCL_XMX_FUSED_EXPERT=1 KT_SYCL_XMX_DECODE_MERGE=separate
 export KT_SYCL_XMX_FUSED_QUANT=prefill KT_SYCL_XMX_NUMA_DISPATCH=1
 export KT_SYCL_XMX_GRAPH=0 KT_SYCL_XMX_HOST_QUANT=0
@@ -23,7 +24,7 @@ export KT_SYCL_XMX_TRACE=0 KT_SYCL_XMX_TRACE_EVERY=0 KT_SYCL_PROFILE=0
 export SGLANG_DISABLE_CUDNN_CHECK=1 SGLANG_MAMBA_CONV_DTYPE=float16
 # Fail explicitly if an old/uncompiled extension is installed. C++ validates
 # fixed dimensions, group size and device aspects when model weights load.
-"$PYTHON" -c 'from kt_kernel import kt_kernel_ext as e; assert hasattr(e.moe, "SYCLXMXGPTQInt4_MOE") and getattr(e.moe.SYCLXMXGPTQInt4_MOE, "implementation_revision", lambda: 0)() >= 4, "Installed extension is too old; rebuild kt-kernel with CPUINFER_USE_SYCL=1"'
+"$PYTHON" -c 'from kt_kernel import kt_kernel_ext as e; assert hasattr(e.moe, "SYCLXMXGPTQInt4_MOE") and getattr(e.moe.SYCLXMXGPTQInt4_MOE, "implementation_revision", lambda: 0)() >= 5, "Installed extension is too old; rebuild kt-kernel with CPUINFER_USE_SYCL=1"'
 exec "$PYTHON" -m sglang.launch_server \
   --model "$MODEL" --kt-weight-path "$MODEL" --kt-method SYCL_GPTQ_INT4 \
   --host "${KT_HOST:-127.0.0.1}" --port "${KT_PORT:-30000}" \
