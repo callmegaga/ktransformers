@@ -15,6 +15,14 @@ case "$PREFILL_PROFILE" in
       echo "v6 vectorized prefill enabled. Hybrid NVIDIA Marlin is not bitwise repeatable; see SYCL-IGPU-Validation_zh.md." >&2 ;;
   *) echo "KT_IGPU_PREFILL_PROFILE must be v5 or v6: $PREFILL_PROFILE" >&2; exit 2 ;;
 esac
+# CUDA dense paths change reduction order (not quantization). Keep them opt-in
+# until broader whole-model quality validation; select BEFORE graph capture.
+DENSE_PROFILE=${KT_IGPU_DENSE_PROFILE:-native}
+case "$DENSE_PROFILE" in
+  native|linear|head-row|head-pad4|both-row|both-pad4) ;;
+  *) echo "KT_IGPU_DENSE_PROFILE must be native, linear, head-row, head-pad4, both-row or both-pad4" >&2; exit 2 ;;
+esac
+export SGLANG_KT_CUDA_DENSE="$DENSE_PROFILE"
 [[ -d "$MODEL" ]] || { echo "Model directory not found: $MODEL" >&2; exit 1; }
 [[ -x "$PYTHON" ]] || { echo "Python not found: $PYTHON" >&2; exit 1; }
 [[ -r "$SETVARS" ]] || { echo "oneAPI environment not found: $SETVARS" >&2; exit 1; }
@@ -36,6 +44,10 @@ export SGLANG_DISABLE_CUDNN_CHECK=1 SGLANG_MAMBA_CONV_DTYPE=float16
 # Fail explicitly if an old/uncompiled extension is installed. C++ validates
 # fixed dimensions, group size and device aspects when model weights load.
 "$PYTHON" -c "from kt_kernel import kt_kernel_ext as e; assert hasattr(e.moe, 'SYCLXMXGPTQInt4_MOE') and getattr(e.moe.SYCLXMXGPTQInt4_MOE, 'implementation_revision', lambda: 0)() >= ${MIN_REVISION}, 'Installed extension is too old; rebuild kt-kernel with CPUINFER_USE_SYCL=1'"
+if [[ "$DENSE_PROFILE" != native ]]; then
+  echo "Opt-in CUDA dense profile: $DENSE_PROFILE; FP16 weights retained, reduction order may differ. See SYCL-IGPU-CUDA-Dense_zh.md." >&2
+  "$PYTHON" -c "from sglang.srt.layers.kt_cuda_dense import get_mode; assert get_mode() == '${DENSE_PROFILE}', 'Install the matching third_party/sglang Python sources before selecting CUDA dense optimization'"
+fi
 exec "$PYTHON" -m sglang.launch_server \
   --model "$MODEL" --kt-weight-path "$MODEL" --kt-method SYCL_GPTQ_INT4 \
   --host "${KT_HOST:-127.0.0.1}" --port "${KT_PORT:-30000}" \

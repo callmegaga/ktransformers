@@ -11,6 +11,9 @@ RTX5060 Laptop 的 Qwen3.5-35B-A3B-GPTQ-Int4 混合推理配置上，进一步�
 详细证据、限制和未推广的实验见 [长上下文复核与瓶颈](SYCL-IGPU-Validation_zh.md)。
 这不代表整个混合框架逐位确定，也不是完整 PPL / 下游质量验收。
 
+后续整模型 decode 优化见 [CUDA dense 路径研究](SYCL-IGPU-CUDA-Dense_zh.md)；
+该路径与本页 iGPU v6 是两个独立开关，默认仍保留 native CUDA dense。
+
 ## 实现
 
 - `gptq_int4_xmx-prefill.hpp`：保留 gate M8N32、down M16N32 和现有DPAS计算；

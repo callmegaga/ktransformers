@@ -67,3 +67,47 @@ printf '%s/%s\n' "$KT_SYCL_XMX_PREFILL_LOAD" "$KT_SYCL_XMX_PREFILL_MERGE"
     env.pop('KT_IGPU_PREFILL_PROFILE', None)
     result = subprocess.run(['bash', str(SCRIPT)], env=env, capture_output=True, text=True, check=True)
     assert result.stdout.strip() == 'gather/vector'
+
+
+def test_invalid_cuda_dense_profile_is_an_error():
+    env = os.environ | {'KT_IGPU_DENSE_PROFILE': 'typo'}
+    result = subprocess.run(['bash', str(SCRIPT)], env=env, capture_output=True, text=True)
+    assert result.returncode == 2
+    assert 'KT_IGPU_DENSE_PROFILE must be' in result.stderr
+
+
+@pytest.mark.parametrize('profile', ['native', 'linear', 'head-pad4', 'both-row', 'both-pad4'])
+def test_cuda_dense_profile_is_exported_and_preflighted(tmp_path, profile):
+    model = tmp_path / 'model'; model.mkdir()
+    setvars = tmp_path / 'setvars.sh'; setvars.write_text('true\n')
+    python = tmp_path / 'python'
+    python.write_text('''#!/bin/bash
+if [[ $1 == -c ]]; then
+  if [[ $2 == *kt_cuda_dense* ]]; then echo dense-preflight; fi
+  exit 0
+fi
+printf 'mode=%s\n' "$SGLANG_KT_CUDA_DENSE"
+''')
+    python.chmod(0o755)
+    env = os.environ | {'KT_MODEL_PATH': str(model), 'KT_PYTHON': str(python),
+                        'ONEAPI_SETVARS': str(setvars), 'KT_IGPU_DENSE_PROFILE': profile,
+                        'SGLANG_KT_CUDA_DENSE': 'stale-inherited-value'}
+    result = subprocess.run(['bash', str(SCRIPT)], env=env, capture_output=True, text=True, check=True)
+    assert ('dense-preflight' in result.stdout) == (profile != 'native')
+    assert f'mode={profile}' in result.stdout
+
+
+def test_old_sglang_dense_preflight_is_not_ignored(tmp_path):
+    model = tmp_path / 'model'; model.mkdir()
+    setvars = tmp_path / 'setvars.sh'; setvars.write_text('true\n')
+    python = tmp_path / 'python'
+    python.write_text('''#!/bin/bash
+if [[ $1 == -c && $2 == *kt_cuda_dense* ]]; then exit 9; fi
+if [[ $1 == -m ]]; then echo unexpected-launch; fi
+''')
+    python.chmod(0o755)
+    env = os.environ | {'KT_MODEL_PATH': str(model), 'KT_PYTHON': str(python),
+                        'ONEAPI_SETVARS': str(setvars), 'KT_IGPU_DENSE_PROFILE': 'linear'}
+    result = subprocess.run(['bash', str(SCRIPT)], env=env, capture_output=True, text=True)
+    assert result.returncode == 9
+    assert 'unexpected-launch' not in result.stdout

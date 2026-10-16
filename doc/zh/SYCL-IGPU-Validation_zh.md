@@ -1,5 +1,8 @@
 # Panther Lake iGPU：长上下文复核与下一阶段瓶颈
 
+后续研究见 [2026-10-16 CUDA dense decode](SYCL-IGPU-CUDA-Dense_zh.md)。
+原验证记录及非确定性限制保留。
+
 2026-10-15，接续 [v6 prefill 向量读取](SYCL-IGPU-Prefill-Loads_zh.md)。
 平台与模型不变：Core Ultra 7 356H / Intel `b0a0` / RTX 5060 Laptop，
 Qwen3.5-35B-A3B-GPTQ-Int4。本文的整模型执行仍是 **CPU / NVIDIA / Intel iGPU 混合推理**，
