@@ -437,7 +437,16 @@ if(KTRANSFORMERS_CPU_DEBUG)
         ${CMAKE_CURRENT_SOURCE_DIR}/cpu_backend/test/test_task_queue.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/cpu_backend/task_queue.cpp
     )
-    target_link_libraries(test_task_queue PRIVATE Threads::Threads)
+    target_link_libraries(test_task_queue PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_executable(
+            test_scheduling_trace
+            ${CMAKE_CURRENT_SOURCE_DIR}/cpu_backend/test/test_scheduling_trace.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/cpu_backend/task_queue.cpp
+        )
+        target_link_libraries(test_scheduling_trace PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
+        set_target_properties(test_scheduling_trace PROPERTIES ENABLE_EXPORTS ON)
+    endif()
     add_executable(
         test_shared_mem_buffer_lifetime
         ${CMAKE_CURRENT_SOURCE_DIR}/cpu_backend/test/test_shared_mem_buffer_lifetime.cpp
@@ -818,6 +827,8 @@ else()
     pybind11_add_module(${PROJECT_NAME} MODULE ${ALL_SOURCES})
     message(STATUS "LTO: disabled")
 endif()
+
+target_link_libraries(${PROJECT_NAME} PRIVATE ${CMAKE_DL_LIBS})
 
 if(KTRANSFORMERS_CPU_USE_ONEDNN_VNNI)
     if(KTRANSFORMERS_ONEDNN_SOURCE_DIR)

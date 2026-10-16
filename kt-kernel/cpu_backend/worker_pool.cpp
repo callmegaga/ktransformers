@@ -9,6 +9,7 @@
  **/
 
 #include "worker_pool.h"
+#include "scheduling_trace.h"
 
 #include <hwloc/bitmap.h>
 #include <numa.h>
@@ -364,6 +365,14 @@ NumaJobDistributor::~NumaJobDistributor() {
 #ifdef USE_NUMA_JOB_DIRECT_WORK
 
 void NumaJobDistributor::do_numa_job(std::function<void(int)> compute_func) {
+  const auto trace_id = kt_scheduling_trace::next_id();
+  kt_scheduling_trace::Scope trace(kt_scheduling_trace::NumaSubmit, this, trace_id);
+  if (trace_id) {
+    compute_func = [original = std::move(compute_func), trace_id, this](int part) {
+      kt_scheduling_trace::Scope trace(kt_scheduling_trace::NumaRun, this, trace_id);
+      original(part);
+    };
+  }
   this->compute_func = compute_func;
   auto me_numa = numa_node_of_cpu(sched_getcpu());
   for (int i = 0; i < numa_count; i++) {
@@ -385,6 +394,14 @@ void NumaJobDistributor::do_numa_job(std::function<void(int)> compute_func) {
 }
 #else
 void NumaJobDistributor::do_numa_job(std::function<void(int)> compute_func) {
+  const auto trace_id = kt_scheduling_trace::next_id();
+  kt_scheduling_trace::Scope trace(kt_scheduling_trace::NumaSubmit, this, trace_id);
+  if (trace_id) {
+    compute_func = [original = std::move(compute_func), trace_id, this](int part) {
+      kt_scheduling_trace::Scope trace(kt_scheduling_trace::NumaRun, this, trace_id);
+      original(part);
+    };
+  }
   this->compute_func = compute_func;
   for (int i = 0; i < numa_count; i++) {
     {

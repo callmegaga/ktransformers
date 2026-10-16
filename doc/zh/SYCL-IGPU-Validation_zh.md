@@ -1,5 +1,7 @@
 # Panther Lake iGPU：长上下文复核与下一阶段瓶颈
 
+后续 CPUInfer/callback 测量见 [调度研究](SYCL-IGPU-Scheduling_zh.md)。
+
 后续研究见 [2026-10-16 CUDA dense decode](SYCL-IGPU-CUDA-Dense_zh.md)。
 原验证记录及非确定性限制保留。
 

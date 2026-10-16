@@ -8,6 +8,7 @@
  * @Copyright (c) 2024 by KVCache.AI, All Rights Reserved.
  **/
 #include "task_queue.h"
+#include "scheduling_trace.h"
 
 #include <pthread.h>
 #include <sched.h>
@@ -21,6 +22,9 @@ TaskQueue::TaskQueue() : done(false), pending(0) {
   head.store(dummy, std::memory_order_relaxed);
   tail.store(dummy, std::memory_order_relaxed);
   workerThread = std::thread(&TaskQueue::worker, this);
+#ifdef __linux__
+  pthread_setname_np(workerThread.native_handle(), "kt_task_queue");
+#endif
 }
 
 TaskQueue::~TaskQueue() {
@@ -40,8 +44,18 @@ TaskQueue::~TaskQueue() {
 }
 
 void TaskQueue::enqueue(std::function<void()> task) {
+  const auto trace_id = kt_scheduling_trace::next_id();
+  kt_scheduling_trace::Scope trace(kt_scheduling_trace::QueueEnqueue, this, trace_id);
   pending.fetch_add(1, std::memory_order_acq_rel);
-  Node* node = new Node(task);
+  Node* node;
+  if (trace_id) {
+    node = new Node([task = std::move(task), trace_id, this] {
+      kt_scheduling_trace::Scope trace(kt_scheduling_trace::QueueRun, this, trace_id);
+      task();
+    });
+  } else {
+    node = new Node(task);
+  }
   Node* prev = tail.exchange(node, std::memory_order_acq_rel);
   prev->next.store(node, std::memory_order_release);
   {
@@ -51,6 +65,7 @@ void TaskQueue::enqueue(std::function<void()> task) {
 }
 
 void TaskQueue::sync(size_t allow_n_pending) {
+  kt_scheduling_trace::Scope trace(kt_scheduling_trace::QueueSync, this);
   std::exception_ptr task_exception;
   {
     std::unique_lock<std::mutex> lock(mtx);
@@ -97,3 +112,6 @@ void TaskQueue::worker() {
     }
   }
 }
+
+// Feature probe for the external diagnostic collector, not a dispatch profile.
+extern "C" __attribute__((visibility("default"))) int kt_cpuinfer_scheduling_revision() { return 1; }

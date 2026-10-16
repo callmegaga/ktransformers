@@ -5,6 +5,8 @@
 模型为 Qwen3.5-35B-A3B-GPTQ-Int4，40 层、top-k8、H2048、I512、group128。
 **这是 NVIDIA + Intel iGPU + CPU 的整模型混合推理优化，不是新的纯 iGPU kernel。**
 
+后续主机回调/队列时间线与同步原型见 [调度研究](SYCL-IGPU-Scheduling_zh.md)。
+
 ## 为什么继续研究 NVIDIA dense
 
 前一轮 CUPTI 数据显示 decode graph 中 FP16 cuBLAS GEMV 值得进一步验证。
