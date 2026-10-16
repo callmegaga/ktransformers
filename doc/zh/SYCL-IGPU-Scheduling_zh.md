@@ -63,6 +63,72 @@ CUDA runtime stream handle 不是 CUPTI streamId，不能把它们直接当成�
 校准 trace 中，NUMA host forward 与 NVIDIA kernel 的观测重叠非常小。
 仍不能把未覆盖区间全部归为 callback：它还可能包含传输、事件调度与其它工作。
 
+## 异构 CPU 核心：NUMA 亲和性不足以表达大小核分工
+
+本机 Linux 拓扑（2026-10-16，本机 CPU 编号，不可照搬到其它机器）：
+
+|逻辑 CPU|PMU 类别|最高频率|`cpu_capacity`|共享缓存分组|
+|---|---|---:|---:|---|
+|0–3|`cpu_core`，P 核|4.7GHz|1004–1024|各自 L2；与 4–11 共享 L3|
+|4–11|`cpu_atom`，较高频组|3.7GHz|714|4–7 / 8–11 各共享 L2；与 P 核共享 L3|
+|12–15|`cpu_atom`，较低频组|3.3GHz|637|共享 L2；sysfs 未列出该组的 L3|
+
+证据来自 `/sys/bus/event_source/devices/{cpu_core,cpu_atom}/cpus` 和各 CPU 的
+`cpufreq/cpuinfo_max_freq`、`cpu_capacity`、`cache/index*/shared_cpu_list`。
+低频 Atom 组在实验中按实际拓扑命名，不仅凭频率推断具体微架构身份。
+`cpu_capacity` 不是本后端 AVX2/VNNI/SYCL 提交性能的实测比例，不能直接换算吞吐。
+本机 16 个逻辑 CPU 对应 16 个物理核、没有 SMT，且**全部在 NUMA node0**。
+`KT_SYCL_XMX_NUMA_DISPATCH=1` 是“启用 NUMA 分派路径”，**不是选择 NUMA node1**。
+
+上一轮 trace 中，实际 NUMA/SYCL forward 已在 P0；CUDA callback 和 TaskQueue
+却经常在 Atom 核间迁移。因此“NUMA 放置正确”不代表整条提交链都在快核上。
+下面仅固定 TaskQueue 到 P3 的负结果，**不能推出 P 核无用或所有绑核均无收益**：
+尚未隔离 CUDA callback、SGLang 主线程、TaskQueue 忙等与 SYCL 执行线程的联合放置。
+尤其不能把忙等线程与提交线程绑定到同一个核心，再把争用造成的退化归因于核心类型。
+
+后续测试按角色分别设置并验证亲和性，比较分离 P 核与部分 Atom 分工；保留同进程
+未绑定对照并随机交错，记录真实 TID、允许 CPU、采样落点、CPU 时间、频率和温度。
+只观察温度/频率不等于测量封装功率；本用户当前无权读取 RAPL `energy_uj`。
+该研究不增加默认绑核，不改变系统 governor、功率上限或全机 CPU 配置。
+
+### 补充的联合绑核实测
+
+同一存活 server、同一轻量 callback 线程标识 interposer，原 CUDA callback 调度路径、
+GPU experts8、iGPU v6、**opt-in both-row dense**；每组每长度 3 次、256 输出 tokens，
+6 种配置按轮随机交错，合计 36 次有效请求。标识器只包装原回调并在首次执行时命名，
+不记录时钟/事件；仍有非零 wrapper 成本，所以只用于本组策略相对比较，
+**不是新的无插桩生产吞吐基线，也不是 mapped-memory 原型的绑核结果**。
+
+|配置|1K decode tok/s|4K decode tok/s|
+|---|---:|---:|
+|原亲和性|42.90|41.54|
+|四个关键角色分别 P0/P1/P2/P3|41.57|40.47|
+|执行 P0，队列 Atom4，回调 P3|42.06|40.91|
+|执行 P0，队列 Atom4，回调 Atom5|43.13|41.80|
+|执行 P0，队列 Atom12，回调 Atom13|43.73|42.59|
+|执行组 Atom6，队列 Atom4，回调 P3|39.56|38.45|
+
+除原亲和性对照外，SGLang 主线程都固定 P1。执行组包含实际 NUMA 主线程以及继承其
+线程名/亲和性的 SYCL helper；没有把同名 helper 误认成另一条专家执行线程。
+其余运行时/CPUInfer 子 worker 的亲和性不变；采样显示 CPUInfer 子 worker 无累计 CPU ticks，
+所以这些结论也不能外推成 AVX2/VNNI CPU 专家计算的最佳绑核方案。
+
+更严格的单因素比较是表中“执行 P0，队列 Atom4，回调 P3”与最后一行：
+只将执行线程组由 P0 改至 Atom6，1K/4K decode 分别下降 **5.93% / 6.00%**。
+另一方面，四个关键角色分别固定到四个 P 核，比原设置平均慢约 **3.1% / 2.6%**。
+执行保留 P0、队列/回调移至 Atom12/13 的候选平均快约 **1.9% / 2.5%**。
+这支持“按角色分工”，但不证明所有大核绑核无用，也不证明低频核心天然更适合所有通知任务。
+
+73 个观测线程的身份/亲和性检查通过，结束前已恢复；所有 36 次均完整输出 256 tokens。
+首个 baseline 1K prefill 有冷启动离群，**不从这组数据宣称 prefill 提升**。
+所有配置采样的 iGPU 实际频率中位数均为 2450MHz；没有功率测量，不能把差异直接归因于
+省电或 GPU 睿频。三轮、单请求、同一启动的结果仍需独立启动和热稳态复验。
+没有把约 2% 的候选收益设为默认，也没有将其叠加到上一轮 memop 原型数字上。
+下一阶段原生 signal bridge 应继续区分执行/提交、通知和忙等角色，而不是全进程只用大核。
+
+数据、精简逐请求记录、亲和性恢复与 46 项实际结果审计、8 项协议单测、graph callback
+标识自测和复现脚本：`/home/wy/work/kt-perf-log/igpu-v10-hybrid-affinity/`。
+
 ## 未采纳的调度“简化”
 
 同一实验二进制、native CUDA dense，每档 3 次、128 输出 tokens：
@@ -74,7 +140,7 @@ CUDA runtime stream handle 不是 CUPTI streamId，不能把它们直接当成�
 |TaskQueue 固定 CPU0，NUMA dispatch0|31.66|33.64|
 |TaskQueue 固定 CPU3，NUMA dispatch0|37.49|35.98|
 
-没有因为少一次转交就更快，直接执行反而明显退化。
+这些配置中没有因为少一次转交就更快，直接执行反而明显退化；这不否定尚未测试的联合大小核放置。
 固定 CPU 功能和 feature probe 已撤回，只保留实验 patch；没有增加默认 CPU 绑核或忙轮询。
 Linux 原先的 NUMA worker 亲和性和 `KT_SYCL_XMX_NUMA_DISPATCH=1` 保留。
 
